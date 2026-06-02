@@ -1,0 +1,8 @@
+# Core deps — enough to run the LLM victim, faithful retrieval, and episodes (Options A+B).
+# Heavy ML (torch/sentence-transformers/stable-baselines3) stays in requirements.txt for RQ2.
+pyyaml>=6.0
+numpy>=1.26
+anthropic>=0.39
+openai>=1.40
+chromadb>=1.5          # CTI retrieval (bundles MiniLM via ONNX — no torch needed)
+networkx>=3.2          # CE-AKG

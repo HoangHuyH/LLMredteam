@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.sandbox/
+config/local.yaml
+.env
+*.log
+data/raw/            # cloned CASIE + CyEnts datasets (~100MB); rebuild via git clone
+models/              # trained PPO checkpoints
+config/train_fast.yaml

@@ -1,0 +1,30 @@
+# Core
+pyyaml>=6.0
+numpy>=1.26
+scipy>=1.11
+
+# Orchestration / RAG / graph
+langgraph>=0.2
+llama-index>=0.11
+faiss-cpu>=1.8
+networkx>=3.2
+
+# Embeddings / NLP metrics
+sentence-transformers>=3.0
+scikit-learn>=1.4
+
+# RL
+stable-baselines3>=2.3
+gymnasium>=0.29
+
+# LLM victim providers (pluggable — install what you use)
+anthropic>=0.39          # default victim provider
+# openai>=1.40
+# transformers>=4.44     # for local Llama victim
+
+# Stats / reporting
+pandas>=2.2
+statsmodels>=0.14        # paired t-test, ANOVA
+
+# Dev
+pytest>=8.0
