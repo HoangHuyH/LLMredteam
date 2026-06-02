@@ -14,7 +14,15 @@ def make_embed_fn(cfg: dict):
     """Return text -> np.ndarray. Tries Sentence-BERT, falls back to hashing embedding."""
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(cfg.get("sbert_model", "all-MiniLM-L6-v2"))
+        import torch
+        name = cfg.get("sbert_model", "all-MiniLM-L6-v2")
+        device = cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = SentenceTransformer(name, device=device)
+        try:
+            model.encode("_probe_")                      # CUDA-kernel-mismatch guard
+        except Exception as e:
+            print(f"[embed] {device} encode failed ({type(e).__name__}); falling back to CPU")
+            model = SentenceTransformer(name, device="cpu")
         return lambda text: np.asarray(model.encode(text or ""), dtype=np.float32)
     except Exception:
         dim = cfg.get("fallback_dim", 64)
@@ -38,8 +46,18 @@ def make_store_embed_fn(cfg: dict):
     try:
         from sentence_transformers import SentenceTransformer
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer(cfg.get("sbert_model", "all-MiniLM-L6-v2"), device=device)
+        name = cfg.get("sbert_model", "all-MiniLM-L6-v2")
+        device = cfg.get("device")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(name, device=device)
+        # Sanity-probe the device: a mismatched torch/GPU raises CUDA "no kernel image"; if so,
+        # transparently fall back to CPU so the run still completes (just slower).
+        try:
+            model.encode(["_probe_"], convert_to_numpy=True)
+        except Exception as e:
+            print(f"[store_embed] {device} encode failed ({type(e).__name__}); falling back to CPU")
+            model = SentenceTransformer(name, device="cpu")
 
         def embed(texts):
             arr = model.encode(list(texts), batch_size=cfg.get("embed_batch", 256),

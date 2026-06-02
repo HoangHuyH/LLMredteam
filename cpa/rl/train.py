@@ -19,7 +19,8 @@ import argparse
 import yaml
 
 
-def train_ppo(config_path: str, timesteps: int, out: str, group: str = "B", turns: int = 15):
+def train_ppo(config_path: str, timesteps: int, out: str, group: str = "B", turns: int = 15,
+              device: str = "auto"):
     from stable_baselines3 import PPO
     from stable_baselines3.common.monitor import Monitor
     from cpa.rl.gym_env import PoisoningGymEnv
@@ -33,6 +34,7 @@ def train_ppo(config_path: str, timesteps: int, out: str, group: str = "B", turn
         gamma=cfg["mdp"].get("gamma", 0.95),
         n_steps=turns * 8, batch_size=turns * 2, n_epochs=5,
         learning_rate=3e-4, verbose=1, seed=cfg["experiment"].get("seed", 0),
+        device=device,   # "cpu" is fine (and often faster) for this tiny MlpPolicy
     )
     model.learn(total_timesteps=timesteps)
     model.save(out)
