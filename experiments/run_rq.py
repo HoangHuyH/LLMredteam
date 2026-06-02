@@ -179,11 +179,14 @@ def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int)
             agg[k] += v
     tp, fn = agg["poison_blocked"], agg["poison_passed"]      # poison = positive class to block
     fp, tn = agg["real_blocked"], agg["real_passed"]
+    rc = [r["real_corpus_retention"] for r in rows["on"] if "real_corpus_retention" in r]
     out["feed_filter"] = {
         "confusion": agg,
         "poison_recall": round(tp / (tp + fn), 4) if (tp + fn) else None,     # % poison caught
         "poison_precision": round(tp / (tp + fp), 4) if (tp + fp) else None,  # of blocked, % poison
-        "real_retention": round(tn / (tn + fp), 4) if (tn + fp) else None,    # % real kept
+        "real_retention_in_feed": round(tn / (tn + fp), 4) if (tn + fp) else None,
+        # Corpus-level: avg fraction of genuine CTI the verifier keeps (feed-starvation check).
+        "real_corpus_retention": round(mean(rc), 4) if rc else None,
     }
     out["n_episodes_per_arm"] = len(rows["off"])
     return out

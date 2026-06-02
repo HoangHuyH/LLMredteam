@@ -26,12 +26,26 @@ from cpa.rl.policy import make_policy
 from cpa.metrics.effectiveness import attack_success
 from cpa.metrics.stealth import undetected_rate, detection_score
 from cpa.metrics.efficiency import first_major_impact_turn
-from experiments.backends import make_embed_fn, make_detector_fn
+from experiments.backends import make_embed_fn, make_detector_fn, make_store_embed_fn
 
 
 def load_cfg(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+# Built once and reused across episodes (loading SentenceTransformer per episode would dominate
+# runtime). Enabled by config cti_store.gpu_embed; used to embed the store on a GPU when present.
+_STORE_EMBED_FN = None
+_STORE_EMBED_INIT = False
+
+
+def _store_embed_fn(cfg: dict):
+    global _STORE_EMBED_FN, _STORE_EMBED_INIT
+    if not _STORE_EMBED_INIT:
+        _STORE_EMBED_FN = make_store_embed_fn(cfg.get("backends", {}))
+        _STORE_EMBED_INIT = True
+    return _STORE_EMBED_FN
 
 
 def run_one(cfg: dict, target: dict, group: str, policy_name: str,
@@ -50,7 +64,8 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
     # Isolated in-memory store per episode so poison never leaks across runs (RQ sweeps).
     store_cfg = {**cfg["cti_store"], "in_memory": True,
                  "collection_name": f"cti_{target['id']}_{group}_{policy_name}_{seed}"}
-    store = make_store(store_cfg)
+    store_embed = _store_embed_fn(cfg) if cfg["cti_store"].get("gpu_embed") else None
+    store = make_store(store_cfg, embed_fn=store_embed)
     store.seed_real(cfg["cti_store"].get("seed_real_cti", ""),
                     sample_size=cfg["cti_store"].get("seed_sample_size"), seed=seed)
 
@@ -112,6 +127,15 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
     }
     if defense:
         result["filter_stats"] = dict(env.filter_stats)
+        # Corpus-level sanity check: would the verifier keep GENUINE CTI? Under Group B the
+        # top-k feed is dominated by poison, so real records rarely reach it; verify all real
+        # records in the store directly to confirm the filter is discriminating, not feed-starving.
+        corpus = store.all()
+        real_recs = [r for r in corpus if not r.is_poison]
+        if real_recs:
+            kept = sum(1 for r in real_recs
+                       if verifier.verify(r, corpus).trust >= verifier.threshold)
+            result["real_corpus_retention"] = round(kept / len(real_recs), 4)
     return result
 
 

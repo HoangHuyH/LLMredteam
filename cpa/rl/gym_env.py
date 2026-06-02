@@ -28,7 +28,7 @@ from cpa.orchestrator.egress_guard import install_guard
 from cpa.mdp.env import PoisoningEnv
 from cpa.mdp.action import ACTION_SPACE
 from cpa.rl.policy import decode_action
-from experiments.backends import make_embed_fn, make_detector_fn
+from experiments.backends import make_embed_fn, make_detector_fn, make_store_embed_fn
 
 _STATE_DIM = 8 + 7 + 7  # e_kg(8) + v_obs(7) + h_hist(7)
 
@@ -55,6 +55,10 @@ class PoisoningGymEnv(_make_gym_base()):
         # Expensive backends built once and reused across episodes.
         self._embed = make_embed_fn(cfg.get("backends", {}))
         self._detect = make_detector_fn(cfg.get("backends", {}))
+        # Optional GPU batch embedder for the CTI store (cti_store.gpu_embed) — built once so
+        # PPO's 1000s of episode resets don't reload the model; big speedup on Kaggle GPU.
+        self._store_embed = (make_store_embed_fn(cfg.get("backends", {}))
+                             if cfg["cti_store"].get("gpu_embed") else None)
         self._pool_size = cfg["generator"].get("pool_size", 16)
 
         self.action_space = spaces.MultiDiscrete([
@@ -70,7 +74,7 @@ class PoisoningGymEnv(_make_gym_base()):
         gt = {v["id"] for v in target.get("ground_truth_vulns", [])}
         store_cfg = {**self.cfg["cti_store"], "in_memory": True,
                      "collection_name": f"train_{self._ep}_{seed}"}
-        store = make_store(store_cfg)
+        store = make_store(store_cfg, embed_fn=self._store_embed)
         store.seed_real(self.cfg["cti_store"].get("seed_real_cti", ""),
                         sample_size=self.cfg["cti_store"].get("seed_sample_size"), seed=seed)
         pool = FakeCTIGenerator(self.cfg["generator"]).build_pool(target, group=self.group)

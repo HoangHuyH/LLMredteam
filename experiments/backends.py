@@ -30,6 +30,26 @@ def make_embed_fn(cfg: dict):
         return hashing_embed
 
 
+def make_store_embed_fn(cfg: dict):
+    """Return a BATCH embedder (List[str] -> list[list[float]]) for ChromaCTIStore, on GPU if
+    available. This replaces Chroma's CPU ONNX MiniLM — the per-episode bottleneck — so re-embedding
+    the corpus each episode is far faster on a Kaggle GPU. Returns None if sentence-transformers
+    is unavailable (store then falls back to its built-in ONNX encoder)."""
+    try:
+        from sentence_transformers import SentenceTransformer
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(cfg.get("sbert_model", "all-MiniLM-L6-v2"), device=device)
+
+        def embed(texts):
+            arr = model.encode(list(texts), batch_size=cfg.get("embed_batch", 256),
+                               convert_to_numpy=True, normalize_embeddings=False)
+            return arr.tolist()
+        return embed
+    except Exception:
+        return None
+
+
 def make_detector_fn(cfg: dict):
     """Return text -> list[float] detector probs. Fallback is a length/keyword heuristic.
 
