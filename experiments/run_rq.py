@@ -185,6 +185,10 @@ def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int)
         "poison_recall": round(tp / (tp + fn), 4) if (tp + fn) else None,     # % poison caught
         "poison_precision": round(tp / (tp + fp), 4) if (tp + fp) else None,  # of blocked, % poison
         "real_retention_in_feed": round(tn / (tn + fp), 4) if (tn + fp) else None,
+        # Anti-starvation check: real records guaranteed into the feed now reach the verifier,
+        # so this is > 0 (was always 0 before, which made real_retention_in_feed null).
+        "real_in_feed_total": tn + fp,
+
         # Corpus-level: avg fraction of genuine CTI the verifier keeps (feed-starvation check).
         "real_corpus_retention": round(mean(rc), 4) if rc else None,
     }

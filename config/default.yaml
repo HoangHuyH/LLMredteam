@@ -91,3 +91,6 @@ detectors:
 defense:
   corroboration_k: 2                   # >=K independent sources sharing a CVE => corroborated
   trust_threshold: 0.5                 # trust below this => filtered out
+  guarantee_real_k: 2                  # reserve >=K feed slots for the best genuine (real) CTI
+                                       # records so context-aware poison can't starve the feed —
+                                       # only active on the defense path (verifier ON).

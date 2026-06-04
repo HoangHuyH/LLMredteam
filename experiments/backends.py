@@ -69,9 +69,16 @@ def make_store_embed_fn(cfg: dict):
 
 
 def make_detector_fn(cfg: dict):
-    """Return text -> list[float] detector probs. Fallback is a length/keyword heuristic.
+    """Return text -> list[float] detector probs (callers use max(probs) as the AI-prob).
 
-    TODO: replace with real GLTR + RoBERTa fake-CTI detectors.
+    cfg["detector_backend"] selects the detector:
+      "heuristic" (DEFAULT) -- zero-dependency keyword proxy; keeps the offline/CI pipeline
+                               identical to today.
+      "roberta" | "gltr" | "ensemble" -- real detectors from cpa.detection (RoBERTa fake/AI-text
+                               classifier and/or a GLTR-style GPT-2 log-rank feature). These
+                               lazy-import torch/transformers; if those are unavailable OR a model
+                               fails to load we print a one-line notice and FALL BACK to the
+                               keyword heuristic. This never raises.
     """
     def heuristic(text: str):
         t = (text or "")
@@ -82,4 +89,19 @@ def make_detector_fn(cfg: dict):
                 score += 0.2
         return [min(score, 1.0)]
 
-    return heuristic
+    backend = (cfg.get("detector_backend") or "heuristic").lower()
+    if backend == "heuristic":
+        return heuristic
+
+    try:
+        from cpa.detection import make_real_detector
+        real = make_real_detector(cfg, backend)
+    except Exception as e:
+        print(f"[detector] backend '{backend}' init failed ({type(e).__name__}); "
+              "falling back to keyword heuristic")
+        return heuristic
+    if real is None:
+        print(f"[detector] backend '{backend}' unavailable (transformers/torch missing or model "
+              "load failed); falling back to keyword heuristic")
+        return heuristic
+    return real

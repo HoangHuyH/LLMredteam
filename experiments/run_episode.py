@@ -23,7 +23,7 @@ from cpa.orchestrator import LocalPublisher
 from cpa.orchestrator.egress_guard import install_guard, assert_no_real_publish
 from cpa.mdp.env import PoisoningEnv
 from cpa.rl.policy import make_policy
-from cpa.metrics.effectiveness import attack_success
+from cpa.metrics.effectiveness import attack_success, cascade_failure_rate, SELF_SABOTAGE_ACTIONS
 from cpa.metrics.stealth import undetected_rate, detection_score
 from cpa.metrics.efficiency import first_major_impact_turn
 from experiments.backends import make_embed_fn, make_detector_fn, make_store_embed_fn
@@ -100,16 +100,22 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
 
     state = env.reset()
     pds_seq, fpr_seq, rewards, stealth_seq = [], [], [], []
+    all_actions = []  # victim actions across all turns, for CFR (self-sabotage) below
     for _ in range(turns):
         state, reward, info = env.step(policy(state))
         pds_seq.append(info["pds"]); fpr_seq.append(info["fpr"])
         rewards.append(reward); stealth_seq.append(info["stealth"])
+        all_actions.extend(getattr(info["turn"], "actions", []) or [])
 
     # Stealth (UR/DS) over the poison actually published this episode.
     poison_texts = [r.text() for r in store.poison_records()]
     per_item = [detector_fn(t) for t in poison_texts]
     ur = undetected_rate(per_item) if per_item else 100.0
     ds = detection_score([p for probs in per_item for p in probs]) if per_item else 0.0
+
+    # Cascade Failure Rate (self-sabotage): % of victim actions that are self-harming.
+    cfr = cascade_failure_rate(all_actions)
+    n_self_sabotage = sum(1 for a in all_actions if a.get("type") in SELF_SABOTAGE_ACTIONS)
 
     final_pds, final_fpr = pds_seq[-1], fpr_seq[-1]
     result = {
@@ -124,6 +130,9 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
         "undetected_rate": ur, "detection_score": ds,
         "stealth_score": float(np.mean(stealth_seq)),
         "mean_reward": float(np.mean(rewards)), "published": publisher.published_count,
+        "cfr": round(cfr, 4),                    # percent of self-sabotage actions across the episode
+        "n_self_sabotage": n_self_sabotage,      # raw count, for aggregation
+        "n_actions_total": len(all_actions),
     }
     if defense:
         result["filter_stats"] = dict(env.filter_stats)

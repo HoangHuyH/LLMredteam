@@ -30,3 +30,14 @@ class StealthEvaluator:
                 np.linalg.norm(self.real_corpus_emb, axis=1) * np.linalg.norm(e) + 1e-9)
             inv = 0.5 * inv + 0.5 * float(np.max(sims))
         return inv
+
+    def detection_risk(self, text: str, channel_prior: float) -> float:
+        """Stealth as env.step sees it: max(content-detector risk, channel base prior).
+
+        This MIRRORS PoisoningEnv.step exactly (max of the strongest detector prob and the
+        channel's CHANNEL_DETECTION_RISK), so the graph path and the RL env stay numerically
+        consistent. Used only when a turn actually publishes; a no-publish turn exposes nothing.
+        """
+        probs = self.detector_probs(text)
+        detector_risk = float(np.max(probs)) if probs else 0.0
+        return max(detector_risk, channel_prior)

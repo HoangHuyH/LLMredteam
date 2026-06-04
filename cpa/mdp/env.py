@@ -102,6 +102,47 @@ class PoisoningEnv:
                 pass
             cti_context.append(r)
 
+        # Anti-starvation (defense path only — gated on self.verifier so attacker-only RQ1/RQ2
+        # episodes stay byte-identical). Under Group B the context-aware poison can sweep the whole
+        # top-k, so no REAL record ever reaches the verifier in-feed and real_retention_in_feed is
+        # undefined. Reserve >=guarantee_real_k slots for the best-scoring genuine records, trimming
+        # the lowest-scoring poison to make room (never dropping real) so the feed stays ~k.
+        if self.verifier is not None:
+            guarantee = self.cfg.get("guarantee_real_k", 2)
+            real_in_feed = sum(1 for r in cti_context if not r.is_poison)
+            if real_in_feed < guarantee:
+                ids_in_feed = {id(r) for r in cti_context}
+                # Pull a larger pool first (scored, ranked by retrieval similarity), then fall back
+                # to the full corpus so we always find real records even if retrieval missed them.
+                candidates: List = []
+                if hasattr(self.store, "query_scored"):
+                    for r, s in self.store.query_scored(profile, k=5 * 4):
+                        if not r.is_poison and id(r) not in ids_in_feed:
+                            try:
+                                r.retrieval_score = s
+                            except Exception:
+                                pass
+                            candidates.append(r)
+                seen = ids_in_feed | {id(r) for r in candidates}
+                for r in self.store.all():
+                    if not r.is_poison and id(r) not in seen:
+                        candidates.append(r)
+                        seen.add(id(r))
+                # Best real first: by retrieval_score when present (else leave query order).
+                candidates.sort(key=lambda r: getattr(r, "retrieval_score", None) or 0.0,
+                                reverse=True)
+                k = len(cti_context) or 5
+                need = guarantee - real_in_feed
+                inject = candidates[:need]
+                # Make room by trimming the lowest-scoring poison so the feed stays ~k.
+                poison = [r for r in cti_context if r.is_poison]
+                poison.sort(key=lambda r: getattr(r, "retrieval_score", None) or 0.0)
+                drop = set()
+                overflow = len(cti_context) + len(inject) - k
+                for r in poison[:max(overflow, 0)]:
+                    drop.add(id(r))
+                cti_context = [r for r in cti_context if id(r) not in drop] + inject
+
         # Defense (ablation): a provenance verifier guards the feed BEFORE the victim reads it.
         # Records below the trust threshold are dropped; we log the filter's confusion matrix
         # so we can report whether it blocks poison without starving the victim of real CTI.
