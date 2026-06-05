@@ -71,7 +71,9 @@ class PoisoningGymEnv(_make_gym_base()):
 
     def _build_episode(self, seed: int) -> PoisoningEnv:
         target = self._targets[self._ep % len(self._targets)]
-        gt = {v["id"] for v in target.get("ground_truth_vulns", [])}
+        # Ground truth keyed by CVE (matches experiments.run_episode): the victim reports by CVE,
+        # so FPR / fake-vuln detection compares against real CVEs, not internal GT-* record ids.
+        gt = {v["cve"] for v in target.get("ground_truth_vulns", []) if v.get("cve")}
         store_cfg = {**self.cfg["cti_store"], "in_memory": True,
                      "collection_name": f"train_{self._ep}_{seed}"}
         store = make_store(store_cfg, embed_fn=self._store_embed)

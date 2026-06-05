@@ -24,6 +24,7 @@ from cpa.orchestrator.egress_guard import install_guard, assert_no_real_publish
 from cpa.mdp.env import PoisoningEnv
 from cpa.rl.policy import make_policy
 from cpa.metrics.effectiveness import attack_success, cascade_failure_rate, SELF_SABOTAGE_ACTIONS
+from cpa.observer.parser import CVE_RE
 from cpa.metrics.stealth import undetected_rate, detection_score
 from cpa.metrics.efficiency import first_major_impact_turn
 from experiments.backends import make_embed_fn, make_detector_fn, make_store_embed_fn
@@ -59,7 +60,9 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
     install_guard()
     assert_no_real_publish(cfg.get("sandbox", {}).get("allow_real_publish", False))
 
-    ground_truth_ids = {v["id"] for v in target.get("ground_truth_vulns", [])}
+    # Ground truth keyed by CVE: the victim reports vulns by CVE, so FPR / fake-vuln detection must
+    # compare against the target's real CVEs, not its internal GT-* record ids.
+    ground_truth_ids = {v["cve"] for v in target.get("ground_truth_vulns", []) if v.get("cve")}
 
     # Isolated in-memory store per episode so poison never leaks across runs (RQ sweeps).
     store_cfg = {**cfg["cti_store"], "in_memory": True,
@@ -98,13 +101,20 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
 
     policy = make_policy(policy_name, pool_size=len(pool), seed=seed, model=cpa_model)
 
+    # Universe of attacker-injected fake CVEs; "adoption" = the victim echoing any of these in its
+    # output (the TARGETED impact signal, vs PDS's undirected drift).
+    poison_cves = {c.upper() for r in pool for c in (r.entities.cves or [])}
+
     state = env.reset()
     pds_seq, fpr_seq, rewards, stealth_seq = [], [], [], []
+    adopt_seq = []    # per-turn: did the victim echo an injected fake CVE?
     all_actions = []  # victim actions across all turns, for CFR (self-sabotage) below
     for _ in range(turns):
         state, reward, info = env.step(policy(state))
         pds_seq.append(info["pds"]); fpr_seq.append(info["fpr"])
         rewards.append(reward); stealth_seq.append(info["stealth"])
+        victim_cves = {m.upper() for m in CVE_RE.findall(getattr(info["turn"], "raw_stdout", "") or "")}
+        adopt_seq.append(bool(victim_cves & poison_cves))
         all_actions.extend(getattr(info["turn"], "actions", []) or [])
 
     # Stealth (UR/DS) over the poison actually published this episode.
@@ -118,14 +128,18 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
     n_self_sabotage = sum(1 for a in all_actions if a.get("type") in SELF_SABOTAGE_ACTIONS)
 
     final_pds, final_fpr = pds_seq[-1], fpr_seq[-1]
+    poison_adopted = any(adopt_seq)
     result = {
         "target": target["id"], "group": group, "policy": policy_name, "seed": seed,
         "defense": defense,
         "final_pds": final_pds, "final_fpr": final_fpr,
         "max_pds": max(pds_seq), "max_fpr": max(fpr_seq),
+        "poison_adopted": poison_adopted,
+        "poison_adoption_rate": round(float(np.mean(adopt_seq)) if adopt_seq else 0.0, 4),
         "success": bool(attack_success(max(pds_seq), max(fpr_seq),
                                        pds_thr=cfg["experiment"]["success_thresholds"]["pds"],
-                                       fpr_thr=cfg["experiment"]["success_thresholds"]["fpr"])),
+                                       fpr_thr=cfg["experiment"]["success_thresholds"]["fpr"],
+                                       poison_adopted=poison_adopted)),
         "atmi": first_major_impact_turn(pds_seq, fpr_seq),
         "undetected_rate": ur, "detection_score": ds,
         "stealth_score": float(np.mean(stealth_seq)),

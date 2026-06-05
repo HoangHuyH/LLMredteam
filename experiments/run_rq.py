@@ -103,7 +103,7 @@ def run_rq1(cfg: dict, episodes: int, turns: int, max_targets: int) -> dict:
             for grp in ("A", "B"):
                 rows[grp].append(run_one(cfg, tgt, grp, "dream", turns, seed=seed))
     out = {}
-    for metric in ("final_pds", "final_fpr"):
+    for metric in ("final_pds", "final_fpr", "poison_adoption_rate"):
         out[metric] = {
             "A": _summ([r[metric] for r in rows["A"]]),
             "B": _summ([r[metric] for r in rows["B"]]),
