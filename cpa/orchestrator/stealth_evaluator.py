@@ -18,7 +18,16 @@ class StealthEvaluator:
         self.embed_fn = embed_fn
 
     def detector_probs(self, text: str) -> List[float]:
-        return [float(d(text)) for d in self.detectors]
+        """One scalar risk per detector. Detectors follow the make_detector_fn contract
+        (text -> list[float], callers reduce with max), so collapse a list/array result to its
+        max; tolerate a bare scalar too."""
+        out: List[float] = []
+        for d in self.detectors:
+            r = d(text)
+            if isinstance(r, (list, tuple, np.ndarray)):
+                r = max(r) if len(r) else 0.0
+            out.append(float(r))
+        return out
 
     def stealth_score(self, text: str) -> float:
         """Mean inverse detection probability, optionally blended with real-CTI similarity."""
