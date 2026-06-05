@@ -18,7 +18,7 @@ list of per-turn dicts with at least reward/pds/fpr):
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable, List, TypedDict
 
 from cpa.orchestrator.egress_guard import install_guard, assert_no_real_publish
 from cpa.orchestrator.stealth_evaluator import StealthEvaluator
@@ -66,7 +66,6 @@ def build_langgraph_pipeline(cfg: dict, env, policy: Callable):
     # Lazy import: langgraph is an optional dependency (present on Kaggle, not in the local venv).
     try:
         from langgraph.graph import StateGraph, END
-        from typing import TypedDict, Any, List
     except Exception:
         print("[orchestrator] langgraph not installed; "
               "build_langgraph_pipeline falling back to linear build_pipeline runner.")

@@ -48,12 +48,22 @@ def load_real_texts(jsonl_path: str, n: int, seed: int) -> List[str]:
     return texts
 
 
-def build_fake_texts(cfg: dict, n: int) -> List[str]:
-    """Generate fake CTI across all configured targets (Group B = context-aware), capped at n."""
-    gen = FakeCTIGenerator(cfg["generator"])
+def build_fake_texts(cfg: dict, n: int, generator: str | None = None) -> List[str]:
+    """Generate fake CTI across all configured targets (Group B = context-aware), capped at n.
+
+    `generator` overrides cfg["generator"]["backend"] ("template" | "llm_local") so the same
+    benchmark can score either the deterministic template poison or the LLM-generated poison.
+    For the slow llm_local backend we shrink the per-target pool to exactly the remaining need
+    so we never generate more LLM samples than the cap requires.
+    """
+    gen_cfg = dict(cfg["generator"])
+    if generator:
+        gen_cfg["backend"] = generator
+    gen = FakeCTIGenerator(gen_cfg)
     targets = cfg["victim"]["targets"]
     texts: List[str] = []
     for target in targets:
+        gen.pool_size = min(gen.pool_size, n - len(texts))   # don't over-generate (matters for LLM)
         for rec in gen.build_pool(target, group="B"):
             texts.append(rec.text())
             if len(texts) >= n:
@@ -97,14 +107,14 @@ def accuracy_at(scores: List[float], labels: List[int], thr: float = 0.5) -> flo
     return correct / len(labels) if labels else 0.0
 
 
-def run(cfg: dict, backend: str, n: int, seed: int) -> dict:
+def run(cfg: dict, backend: str, n: int, seed: int, generator: str | None = None) -> dict:
     det_cfg = dict(cfg.get("backends", {}))
     det_cfg["detector_backend"] = backend
     detector_fn = make_detector_fn(det_cfg)
 
     real_texts = load_real_texts(cfg["cti_store"].get("seed_real_cti", "./data/real_cti_corpus.jsonl"),
                                  n, seed)
-    fake_texts = build_fake_texts(cfg, n)
+    fake_texts = build_fake_texts(cfg, n, generator)
 
     scores: List[float] = []
     labels: List[int] = []
@@ -119,6 +129,7 @@ def run(cfg: dict, backend: str, n: int, seed: int) -> dict:
     fake_scores = [s for s, y in zip(scores, labels) if y == 1]
     return {
         "backend": backend,
+        "generator": generator or cfg["generator"].get("backend", "template"),
         "n_real": len(real_texts),
         "n_fake": len(fake_texts),
         "auc": round(auc, 4),
@@ -136,15 +147,20 @@ def main() -> None:
                     choices=["heuristic", "roberta", "gltr", "ensemble"])
     ap.add_argument("--n", type=int, default=200, help="max real records sampled (and fake cap)")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--generator", default=None, choices=["template", "llm_local"],
+                    help="override generator backend for the fake CTI (default: config value)")
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
-    result = run(cfg, args.backend, args.n, args.seed)
+    result = run(cfg, args.backend, args.n, args.seed, args.generator)
 
-    OUT.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    # Keep template vs llm_local results side by side when --generator is given (avoids overwrite).
+    out = OUT if not args.generator else OUT.with_name(f"detector_benchmark_{args.generator}.json")
+    out.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
-    print(f"\n[benchmark] AUC={result['auc']} acc@0.5={result['accuracy_at_0.5']} "
-          f"(real={result['n_real']}, fake={result['n_fake']}) -> {OUT}")
+    print(f"\n[benchmark] gen={result['generator']} AUC={result['auc']} "
+          f"acc@0.5={result['accuracy_at_0.5']} "
+          f"(real={result['n_real']}, fake={result['n_fake']}) -> {out}")
 
 
 if __name__ == "__main__":
