@@ -38,6 +38,14 @@ def _paired_t(b: List[float], a: List[float]) -> dict:
         return {"note": "scipy not installed — install for t-test"}
     if len(b) != len(a) or len(b) < 2:
         return {"note": "need >=2 paired samples"}
+    diffs = [bi - ai for bi, ai in zip(b, a)]
+    if pstdev(diffs) == 0.0:
+        # zero variance in (b - a) -> t-test undefined (would be NaN/inf).
+        md = mean(diffs)
+        note = ("identical arms — no difference to test" if md == 0.0
+                else "constant non-zero difference — t undefined (no within-pair variance)")
+        return {"t": None, "p": None, "significant_0.05": False,
+                "mean_diff": round(md, 6), "note": note}
     t, p = _stats.ttest_rel(b, a)
     return {"t": round(float(t), 4), "p": round(float(p), 6), "significant_0.05": bool(p < 0.05)}
 
@@ -205,6 +213,8 @@ def main() -> None:
     ap.add_argument("--max-targets", type=int, default=0, help="0 = all targets")
     ap.add_argument("--provider", default="rule_based")
     ap.add_argument("--cpa-model", default=None, help="path to a trained SB3 PPO model (RQ2)")
+    ap.add_argument("--out", default=None,
+                    help="write the report JSON to this path (clean of stdout noise)")
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -225,7 +235,12 @@ def main() -> None:
     if args.rq in ("defense", "all"):
         report["defense_ablation"] = run_defense_ablation(cfg, args.episodes, args.turns,
                                                           args.max_targets)
-    print(json.dumps(report, indent=2))
+    blob = json.dumps(report, indent=2)
+    print(blob)
+    if args.out:
+        from pathlib import Path
+        Path(args.out).write_text(blob, encoding="utf-8")
+        print(f"\n[run_rq] wrote {args.rq} report -> {args.out}")
 
 
 if __name__ == "__main__":
