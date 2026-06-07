@@ -39,7 +39,59 @@ class FakeCTIGenerator:
             return self._template_pool(target, group)
         if self.backend == "llm_local":
             return self._llm_pool(target, group)
+        if self.backend == "dataset":
+            return self._dataset_pool(target, group)
         raise ValueError(f"Unknown generator backend: {self.backend}")
+
+    # --- dataset backend (GFCTI-Finance, Section 3.2) ------------------
+    def _dataset_pool(self, target: dict, group: str) -> List[CTIRecord]:
+        """Draw fake CTI from the GFCTI-Finance jsonl (built by data/build_gfcti.py).
+
+        Rows are filtered by target relevance to preserve the RQ1 manipulation: Group B uses
+        the dataset's high-relevance fake_cti, Group A its low-relevance rows. Falls back to the
+        deterministic template backend if the file is missing or has no matching rows, so default
+        behavior never breaks. cfg keys: dataset_path (default data/gfcti_finance.jsonl).
+        """
+        import json
+        from pathlib import Path
+
+        rel = Relevance.HIGH if group == "B" else Relevance.LOW
+        want = "high" if group == "B" else "low"
+        path = Path(self.cfg.get("dataset_path", "data/gfcti_finance.jsonl"))
+        rows: List[dict] = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("fake_cti") and str(d.get("target_relevance", "")).lower() == want:
+                    rows.append(d)
+        if not rows:
+            print(f"[fake_cti] dataset pool empty/missing for relevance={want} ({path}); "
+                  f"using template backend.")
+            return self._template_pool(target, group)
+
+        pool: List[CTIRecord] = []
+        for i in range(self.pool_size):
+            d = rows[i % len(rows)]
+            text = d["fake_cti"]
+            cves = _CVE_RE.findall(text) or [f"CVE-2026-{1000 + i}"]
+            topic = d.get("topic") or self.topics[i % len(self.topics)]
+            pool.append(CTIRecord(
+                topic=topic,
+                fake_cti=text,
+                target_relevance=rel,
+                entities=CTIEntities(cves=cves),
+                length=len(text),
+                is_poison=True,
+                variant_id=i,
+                source_channel="gfcti-dataset",
+            ))
+        return pool
 
     # --- template backend ----------------------------------------------
     def _template_pool(self, target: dict, group: str) -> List[CTIRecord]:
