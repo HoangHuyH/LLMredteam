@@ -71,6 +71,21 @@ class CPAPolicy:
                          frequency=0.0, timing=1.0)  # stop publishing; victim stays derailed
 
 
+class NoPoisonPolicy:
+    """Control baseline (Section 3.2 'No Poisoning'): never publishes.
+
+    Frequency is held below any publish threshold so no fake CTI ever enters the feed; the victim
+    plans against the genuine corpus only. This is the ground-truth arm that PDS/FPR are normalized
+    against — any deviation it shows is baseline drift, not attack impact.
+    """
+
+    def __init__(self, pool_size: int, **_) -> None:
+        self.pool_size = pool_size
+
+    def __call__(self, state: np.ndarray) -> CPAAction:
+        return CPAAction(variant_id=0, channel_id=0, frequency=0.0, timing=0.0)
+
+
 def decode_action(action, pool_size: int) -> CPAAction:
     """Decode a flat SB3 MultiDiscrete/Box action into a CPAAction."""
     a = np.atleast_1d(action)
@@ -89,4 +104,6 @@ def make_policy(name: str, pool_size: int, seed: int = 0, model=None):
         return DreamBaselinePolicy(pool_size)
     if name == "cpa":
         return CPAPolicy(pool_size, model=model)
+    if name in ("none", "nopoison"):
+        return NoPoisonPolicy(pool_size)
     raise ValueError(f"Unknown policy: {name!r}")
