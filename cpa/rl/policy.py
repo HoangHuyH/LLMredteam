@@ -106,4 +106,9 @@ def make_policy(name: str, pool_size: int, seed: int = 0, model=None):
         return CPAPolicy(pool_size, model=model)
     if name in ("none", "nopoison"):
         return NoPoisonPolicy(pool_size)
+    if name in ("mcts", "mcts_only"):
+        # DREAM planning baseline (C-GPS+MCTS). Imported lazily so the lightweight policies above
+        # never pull the MCTS module unless asked for.
+        from cpa.rl.mcts_policy import MCTSPolicy, MCTSOnlyPolicy
+        return (MCTSPolicy if name == "mcts" else MCTSOnlyPolicy)(pool_size, seed=seed)
     raise ValueError(f"Unknown policy: {name!r}")
