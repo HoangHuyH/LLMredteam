@@ -127,6 +127,12 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
     cfr = cascade_failure_rate(all_actions)
     n_self_sabotage = sum(1 for a in all_actions if a.get("type") in SELF_SABOTAGE_ACTIONS)
 
+    # Mean target-relevance of the poison actually published (RQ3 factor): low/medium/high -> 0.3/0.6/0.9.
+    _rel_map = {"low": 0.3, "medium": 0.6, "high": 0.9}
+    pub_poison = store.poison_records()
+    mean_relevance = (float(np.mean([_rel_map.get(getattr(r.target_relevance, "value", "low"), 0.3)
+                                     for r in pub_poison])) if pub_poison else 0.0)
+
     final_pds, final_fpr = pds_seq[-1], fpr_seq[-1]
     poison_adopted = any(adopt_seq)
     result = {
@@ -138,8 +144,8 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
         "poison_adoption_rate": round(float(np.mean(adopt_seq)) if adopt_seq else 0.0, 4),
         "success": bool(attack_success(max(pds_seq), max(fpr_seq),
                                        pds_thr=cfg["experiment"]["success_thresholds"]["pds"],
-                                       fpr_thr=cfg["experiment"]["success_thresholds"]["fpr"],
-                                       poison_adopted=poison_adopted)),
+                                       fpr_thr=cfg["experiment"]["success_thresholds"]["fpr"])),
+        "mean_relevance": round(mean_relevance, 4),     # RQ3 factor: target relevance of published poison
         "atmi": first_major_impact_turn(pds_seq, fpr_seq),
         "undetected_rate": ur, "detection_score": ds,
         "stealth_score": float(np.mean(stealth_seq)),

@@ -18,6 +18,8 @@ import json
 from statistics import mean, pstdev
 from typing import List
 
+import numpy as np
+
 from experiments.run_episode import load_cfg, run_one
 
 try:
@@ -142,22 +144,69 @@ def run_rq2(cfg: dict, episodes: int, turns: int, max_targets: int, cpa_model=No
     return out
 
 
+def _factor_importance(rows: List[dict], factors: dict, outcome_key: str) -> dict:
+    """Rank `factors` by how strongly they drive `outcome_key` across episodes (RQ3).
+
+    Reports, per factor: the standardized multiple-regression coefficient (beta on z-scored
+    predictors+outcome — |beta| is the relative weight, comparable across factors) and the
+    univariate Pearson r. `ranking_by_abs_beta` is the RQ3 answer: factors strongest-first.
+    A factor with no variance (e.g. relevance when only one group is present) reports null.
+    """
+    y = np.array([float(r[outcome_key]) for r in rows], dtype=float)
+    cols = {f: np.array([float(r[k]) for r in rows], dtype=float) for f, k in factors.items()}
+
+    def _z(a: np.ndarray) -> np.ndarray:
+        sd = a.std()
+        return (a - a.mean()) / sd if sd > 0 else np.zeros_like(a)
+
+    pearson = {f: (round(float(np.corrcoef(a, y)[0, 1]), 4) if a.std() > 0 and y.std() > 0 else None)
+               for f, a in cols.items()}
+    betas = {f: None for f in cols}
+    live = [f for f in cols if cols[f].std() > 0]
+    if y.std() > 0 and live:
+        coef, *_ = np.linalg.lstsq(np.column_stack([_z(cols[f]) for f in live]), _z(y), rcond=None)
+        for f, b in zip(live, coef):
+            betas[f] = round(float(b), 4)
+    ranking = sorted((f for f in betas if betas[f] is not None),
+                     key=lambda f: abs(betas[f]), reverse=True)
+    return {"standardized_beta": betas, "univariate_pearson_r": pearson,
+            "ranking_by_abs_beta": ranking}
+
+
 def run_rq3(cfg: dict, episodes: int, turns: int, max_targets: int, cpa_model=None) -> dict:
-    """RQ3 — factor analysis. Two-way ANOVA of CTI-context (group A/B) x policy (dream/cpa)
-    on attack impact (max_pds) and stealth, with (target, seed) as replicates. Tells us which
-    lever drives the outcome and whether the two interact."""
+    """RQ3 — which factor most strongly drives attack effectiveness (Section 3.3).
+
+    Runs episodes across CTI-context (A/B) x policy (dream/cpa) x (target, seed) so the four
+    proposal factors vary, then ranks them by standardized effect on attack success:
+      target_relevance, stealth_score, long-term impact (CFR), planning_deviation (PDS).
+    PDS is part of the success definition, so its dominance under the success outcome is partly
+    definitional — we also rank effect on poison-adoption (a non-definitional outcome) and report
+    the secondary group x policy ANOVA for continuity with RQ1/RQ2.
+    """
     rows = []
     for tgt in _targets(cfg, max_targets):
         for seed in range(episodes):
             for grp in ("A", "B"):
                 for pol in ("dream", "cpa"):
-                    r = run_one(cfg, tgt, grp, pol, turns, seed=seed,
-                                cpa_model=cpa_model if pol == "cpa" else None)
-                    rows.append(r)
-    out = {"n_episodes": len(rows)}
-    for dv in ("max_pds", "stealth_score"):
-        out[f"anova_{dv}"] = _two_way_anova(rows, "group", "policy", dv)
-    return out
+                    rows.append(run_one(cfg, tgt, grp, pol, turns, seed=seed,
+                                        cpa_model=cpa_model if pol == "cpa" else None))
+    factors = {
+        "target_relevance": "mean_relevance",
+        "stealth_score": "stealth_score",
+        "long_term_impact_cfr": "cfr",
+        "planning_deviation_pds": "max_pds",
+    }
+    return {
+        "n_episodes": len(rows),
+        "factors": factors,
+        "effectiveness_success": _factor_importance(rows, factors, "success"),
+        "effectiveness_adoption": _factor_importance(rows, factors, "poison_adoption_rate"),
+        "anova_group_x_policy": {dv: _two_way_anova(rows, "group", "policy", dv)
+                                 for dv in ("max_pds", "stealth_score")},
+        "note": ("ranking_by_abs_beta = RQ3 answer (strongest factor first). PDS partly defines "
+                 "success, so prefer effectiveness_adoption for a non-circular ranking. "
+                 "Pearson r gives each factor's univariate direction/strength."),
+    }
 
 
 def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int) -> dict:
