@@ -37,8 +37,9 @@ RUN_DET_BENCHMARK = True         # in AUC real-vs-fake của detector (chỉ ch�
 DET_BENCH_LLM     = True          # thêm 1 arm benchmark với fake CTI sinh bằng LLM (llm_local) -> kiểm tra AUC=0.19
                                   # có phải artifact của template không; CHẬM (~200 lần gọi Qwen). False = chỉ template.
 USE_LLM_GENERATOR = False        # True = sinh fake CTI bằng LLM thật (llm_local) — CHẬM; False = template (mặc định)
-USE_GFCTI_DATASET = False        # True = poison pool lấy fake_cti từ data/gfcti_finance.jsonl (build_gfcti)
-                                 #   -> cần file GFCTI thật ở data/raw/GFCTI/; thiếu -> synthetic 5 dòng (fallback)
+USE_GFCTI_DATASET = False        # True = poison pool lấy fake_cti từ dataset thật (clone tự động)
+GFCTI_SOURCE      = "finance"    # "finance"(anotherme13: render real + Qwen sinh fake) | "deepfakeh"(CTI_long.xlsx có sẵn fake)
+GFCTI_LIMIT       = 400          # số seed finance đưa qua Qwen (0 = cả 1239; CHẬM ~ mỗi seed 1 lần gọi Qwen)
 GUARANTEE_REAL_K  = 2            # số CTI thật tối thiểu giữ trong feed khi bật defense (chống feed-starvation)
 # ---- TODO #7 (orchestration) ----
 USE_CURRICULUM    = True          # train PPO curriculum 3 mức: random(A) -> context_aware(B) -> multi_turn  (thay vì 1 mạch)
@@ -337,14 +338,23 @@ cfg["backends"]["detector_backend"] = DETECTOR_BACKEND               # detector 
 cfg.setdefault("defense", {})["guarantee_real_k"] = GUARANTEE_REAL_K  # chống feed-starvation
 if USE_LLM_GENERATOR:                                                # sinh fake CTI bằng LLM thật (fallback template)
     cfg["generator"]["backend"] = "llm_local"; cfg["generator"]["llm_model"] = LLM_MODEL
-elif USE_GFCTI_DATASET:                                              # poison pool từ GFCTI release (Deepfake-H)
-    if not os.path.isdir("data/raw/GFCTI"):                          # clone như CASIE/CyEnts (xlsx bị gitignore)
-        sh("git", "clone", "--depth", "1",
-           "https://github.com/Deepfake-H/Can_LLM_Generated_Misinformation_Be_Detected_a_Study_On_Cyber_Threat_Intelligence",
-           "data/raw/GFCTI")
-    sh(sys.executable, "-m", "pip", "install", "-q", "openpyxl")     # đọc .xlsx
-    sh(sys.executable, "-m", "data.build_gfcti",
-       "--src", "data/raw/GFCTI/dataset/CTI_long.xlsx", "--out", "data/gfcti_finance.jsonl")
+elif USE_GFCTI_DATASET:                                              # poison pool từ dataset thật (clone tự động)
+    if GFCTI_SOURCE == "finance":                                   # render real + Qwen sinh fake tài chính
+        if not os.path.isdir("data/raw/Finance_CTI"):
+            sh("git", "clone", "--depth", "1", "https://github.com/anotherme13/Finance_CTI",
+               "data/raw/Finance_CTI")
+        sh(sys.executable, "-m", "pip", "install", "-q", "bitsandbytes")   # Qwen 4-bit cho gen
+        sh(sys.executable, "-m", "data.gen_gfcti_finance",
+           "--src", "data/raw/Finance_CTI/CTI_extract/finance.json",
+           "--out", "data/gfcti_finance.jsonl", "--limit", str(GFCTI_LIMIT))
+    else:                                                           # Deepfake-H GFCTI (CTI_long.xlsx có sẵn fake)
+        if not os.path.isdir("data/raw/GFCTI"):
+            sh("git", "clone", "--depth", "1",
+               "https://github.com/Deepfake-H/Can_LLM_Generated_Misinformation_Be_Detected_a_Study_On_Cyber_Threat_Intelligence",
+               "data/raw/GFCTI")
+        sh(sys.executable, "-m", "pip", "install", "-q", "openpyxl")
+        sh(sys.executable, "-m", "data.build_gfcti",
+           "--src", "data/raw/GFCTI/dataset/CTI_long.xlsx", "--out", "data/gfcti_finance.jsonl")
     cfg["generator"]["backend"] = "dataset"; cfg["generator"]["dataset_path"] = "data/gfcti_finance.jsonl"
 GPU_CFG = "/kaggle/working/default_gpu.yaml"
 with open(GPU_CFG, "w") as f: yaml.safe_dump(cfg, f, sort_keys=False)
