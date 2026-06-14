@@ -58,7 +58,8 @@ class FakeCTIGenerator:
         rel = Relevance.HIGH if group == "B" else Relevance.LOW
         want = "high" if group == "B" else "low"
         path = Path(self.cfg.get("dataset_path", "data/gfcti_finance.jsonl"))
-        rows: List[dict] = []
+        all_fake: List[dict] = []
+        rel_match: List[dict] = []
         if path.is_file():
             for line in path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
@@ -68,11 +69,16 @@ class FakeCTIGenerator:
                     d = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if d.get("fake_cti") and str(d.get("target_relevance", "")).lower() == want:
-                    rows.append(d)
+                if not d.get("fake_cti"):
+                    continue
+                all_fake.append(d)
+                if str(d.get("target_relevance", "")).lower() == want:
+                    rel_match.append(d)
+        # Prefer rows whose relevance matches the group (paired GFCTI-Finance); else use all fakes
+        # tagged with the group's relevance (the flat GFCTI release carries no relevance label).
+        rows = rel_match or all_fake
         if not rows:
-            print(f"[fake_cti] dataset pool empty/missing for relevance={want} ({path}); "
-                  f"using template backend.")
+            print(f"[fake_cti] dataset pool empty/missing ({path}); using template backend.")
             return self._template_pool(target, group)
 
         pool: List[CTIRecord] = []

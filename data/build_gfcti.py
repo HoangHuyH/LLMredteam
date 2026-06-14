@@ -65,7 +65,7 @@ from typing import Any, Dict, List, Optional
 # Paths
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).parent
-DEFAULT_SRC = _HERE / "raw" / "GFCTI" / "gfcti.jsonl"
+DEFAULT_SRC = _HERE / "raw" / "GFCTI" / "dataset" / "CTI_long.xlsx"   # GFCTI release (Deepfake-H): topic/content/label
 DEFAULT_OUT = _HERE / "gfcti_finance.jsonl"
 
 # ---------------------------------------------------------------------------
@@ -162,6 +162,25 @@ def normalize_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     Returns None if both real_cti and fake_cti are empty (skip degenerate rows).
     """
+    # Flat GFCTI release schema (Deepfake-H repo): one text + a Real/Fake label, not paired.
+    #   CTI_long.xlsx  -> topic / content / label   (label in {Real, Fake})
+    #   CTI_short.xlsx -> Content / Label
+    flat_text = _pick(row, ("content", "Content"))
+    flat_label = _pick(row, ("label", "Label"))
+    if flat_text and flat_label:
+        is_fake = flat_label.strip().lower().startswith("fake")
+        topic = _pick(row, ("topic", "category"), default="unknown")
+        entities = extract_entities(flat_text)
+        return {
+            "real_cti": "" if is_fake else flat_text,
+            "fake_cti": flat_text if is_fake else "",
+            "topic": topic,
+            "target_relevance": "",                 # GFCTI has no relevance label; set at pool-build time
+            "label": "fake" if is_fake else "real",
+            "metadata": {"entities": entities, "length": len(flat_text),
+                         "readability": round(flesch_reading_ease(flat_text), 4)},
+        }
+
     real_cti = _pick(row, _REAL_KEYS)
     fake_cti = _pick(row, _FAKE_KEYS)
     if not real_cti and not fake_cti:
@@ -218,9 +237,17 @@ def _read_csv(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _read_xlsx(path: Path) -> List[Dict[str, Any]]:
+    """Read an .xlsx into list[dict] (needs pandas+openpyxl) — for the GFCTI release files."""
+    import pandas as pd
+    return pd.read_excel(path).to_dict(orient="records")
+
+
 def load_source(path: Path) -> List[Dict[str, Any]]:
-    """Load raw rows from a JSONL or CSV file."""
+    """Load raw rows from an XLSX, JSONL or CSV file."""
     suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xls"):
+        return _read_xlsx(path)
     if suffix == ".csv":
         return _read_csv(path)
     # Default: treat as JSONL (also works for .json newline-delimited)

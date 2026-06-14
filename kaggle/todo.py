@@ -337,8 +337,14 @@ cfg["backends"]["detector_backend"] = DETECTOR_BACKEND               # detector 
 cfg.setdefault("defense", {})["guarantee_real_k"] = GUARANTEE_REAL_K  # chống feed-starvation
 if USE_LLM_GENERATOR:                                                # sinh fake CTI bằng LLM thật (fallback template)
     cfg["generator"]["backend"] = "llm_local"; cfg["generator"]["llm_model"] = LLM_MODEL
-elif USE_GFCTI_DATASET:                                              # poison pool từ GFCTI-Finance jsonl
-    sh(sys.executable, "-m", "data.build_gfcti", "--out", "data/gfcti_finance.jsonl")
+elif USE_GFCTI_DATASET:                                              # poison pool từ GFCTI release (Deepfake-H)
+    if not os.path.isdir("data/raw/GFCTI"):                          # clone như CASIE/CyEnts (xlsx bị gitignore)
+        sh("git", "clone", "--depth", "1",
+           "https://github.com/Deepfake-H/Can_LLM_Generated_Misinformation_Be_Detected_a_Study_On_Cyber_Threat_Intelligence",
+           "data/raw/GFCTI")
+    sh(sys.executable, "-m", "pip", "install", "-q", "openpyxl")     # đọc .xlsx
+    sh(sys.executable, "-m", "data.build_gfcti",
+       "--src", "data/raw/GFCTI/dataset/CTI_long.xlsx", "--out", "data/gfcti_finance.jsonl")
     cfg["generator"]["backend"] = "dataset"; cfg["generator"]["dataset_path"] = "data/gfcti_finance.jsonl"
 GPU_CFG = "/kaggle/working/default_gpu.yaml"
 with open(GPU_CFG, "w") as f: yaml.safe_dump(cfg, f, sort_keys=False)

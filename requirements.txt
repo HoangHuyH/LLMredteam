@@ -28,3 +28,4 @@ statsmodels>=0.14        # paired t-test, ANOVA
 
 # Dev
 pytest>=8.0
+openpyxl
