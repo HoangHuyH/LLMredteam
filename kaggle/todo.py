@@ -407,9 +407,27 @@ if DO_RL_PROOF:
         print(f"  {label:10s} stealth={a['stealth_score']['mean']:.3f}±{a['stealth_score']['std']:.3f}"
               f"  pds={a['max_pds']['mean']:.3f}  fpr={a['max_fpr']['mean']:.3f}  cfr={a['cfr']['mean']:.1f}"
               f"  pub={a['published']['mean']:.2f}  rew={a['mean_reward']['mean']:.3f}  ASR={a['ASR_%']}")
-    s_cpa, s_con, s_dr = (ablation[k]["stealth_score"]["mean"] for k in ("cpa", "constant", "dream"))
-    verdict_stealth = {"cpa_minus_constant": round(s_cpa - s_con, 4), "cpa_minus_dream": round(s_cpa - s_dr, 4),
-                       "RL_useful": bool(s_cpa > s_con + 1e-6 and s_cpa > s_dr + 1e-6)}
+    # RL hữu ích = thắng trên MỤC TIÊU thật, không phải stealth thuần. Stealth-only sai vì 'constant'
+    # luôn stealth cao hơn (publish 1 lần) nhưng ASR thấp. Ta đo: (1) reward-win (objective env tối ưu),
+    # (2) Pareto trên (stealth, ASR) — không baseline nào trội cả hai, (3) stealthiest trong nhóm ASR cao.
+    def _g(k, m): return ablation[k]["ASR_%"] if m == "ASR_%" else ablation[k][m]["mean"]
+    s_cpa, r_cpa, asr_cpa = _g("cpa", "stealth_score"), _g("cpa", "mean_reward"), _g("cpa", "ASR_%")
+    others = [k for k in ablation if k not in ("cpa", "nopoison")]   # so với các baseline tấn công
+    best_base_reward = max((_g(k, "mean_reward") for k in others), default=0.0)
+    dominated = any(_g(k, "stealth_score") >= s_cpa and _g(k, "ASR_%") >= asr_cpa
+                    and (_g(k, "stealth_score") > s_cpa or _g(k, "ASR_%") > asr_cpa) for k in others)
+    high_asr = [k for k in others if _g(k, "ASR_%") >= asr_cpa - 5]   # baseline tấn công mạnh tương đương
+    stealthiest_high_asr = all(s_cpa >= _g(k, "stealth_score") for k in high_asr) if high_asr else True
+    reward_win = r_cpa >= best_base_reward - 1e-6
+    verdict_stealth = {
+        "cpa_reward": round(r_cpa, 4), "best_baseline_reward": round(best_base_reward, 4),
+        "reward_win": bool(reward_win),
+        "pareto_optimal_stealth_vs_asr": bool(not dominated),
+        "stealthiest_among_high_asr": bool(stealthiest_high_asr),
+        "cpa_minus_constant_stealth": round(s_cpa - _g("constant", "stealth_score"), 4),  # tham khảo
+        "cpa_minus_dream_stealth": round(s_cpa - _g("dream", "stealth_score"), 4),
+        "RL_useful": bool(reward_win or (not dominated and stealthiest_high_asr)),
+    }
 
     # obs-perturbation: action có đổi khi che từng khối obs? (deterministic để tín hiệu sạch)
     print("\n=== Obs-perturbation ===")
