@@ -37,7 +37,7 @@ RUN_DET_BENCHMARK = True         # in AUC real-vs-fake của detector (chỉ ch�
 DET_BENCH_LLM     = True          # thêm 1 arm benchmark với fake CTI sinh bằng LLM (llm_local) -> kiểm tra AUC=0.19
                                   # có phải artifact của template không; CHẬM (~200 lần gọi Qwen). False = chỉ template.
 USE_LLM_GENERATOR = False        # True = sinh fake CTI bằng LLM thật (llm_local) — CHẬM; False = template (mặc định)
-USE_GFCTI_DATASET = False        # True = poison pool lấy fake_cti từ dataset thật (clone tự động)
+USE_GFCTI_DATASET = True         # True = poison pool lấy fake_cti từ dataset thật (clone tự động)
 GFCTI_SOURCE      = "finance"    # "finance"(anotherme13: render real + Qwen sinh fake) | "deepfakeh"(CTI_long.xlsx có sẵn fake)
 GFCTI_LIMIT       = 400          # số seed finance đưa qua Qwen (0 = cả 1239; CHẬM ~ mỗi seed 1 lần gọi Qwen)
 GUARANTEE_REAL_K  = 2            # số CTI thật tối thiểu giữ trong feed khi bật defense (chống feed-starvation)
