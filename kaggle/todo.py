@@ -19,17 +19,21 @@
 #   [ ] Benchmark IMPACT ngoài (vd XBOW — Docker host, KHÔNG chạy được trên Kaggle)
 #   [x] Defense: chống feed-starvation (guarantee_real_k CTI thật luôn trong top-k feed). Bật DO_DEFENSE
 # =====================================================================================
-import os, sys, subprocess, json, time, copy
+import os, sys, subprocess, json, time, copy, shutil
 
 REPO_URL, BRANCH, REPO_DIR = "https://github.com/HoangHuyH/LLMredteam.git", "kaggle-run", "/kaggle/working/cpa"
 
 # ---- thí nghiệm nào chạy ----
 DO_RL_PROOF = True     # train PPO trên env reactive + ablation + obs-perturbation (chứng minh RL)
-DO_LLM_RQ1  = True     # RQ1 subset với victim LLM thật Qwen2.5-7B (validated mechanism) — CHẬM
-DO_DEFENSE  = True     # defense ablation: verifier OFF/ON + chống feed-starvation (CTI thật luôn trong feed)
-DO_RQ3      = True      # RQ3: xếp hạng 4-factor (relevance/stealth/CFR/PDS) -> effectiveness
-EVAL_VICTIM = "rule_based"  # victim cho ABLATION + RQ3: "rule_based"(nhanh) | "hf"(Qwen, hợp lệ hơn nhưng RẤT CHẬM
-                            #   -> chỉ dùng với SCALE="smoke"; train PPO + defense luôn giữ rule_based)
+DO_LLM_RQ1  = True     # RQ1 victim Qwen thật — CHẬM. (GIÁ TRỊ NÀY BỊ khối "CHIA 2 SESSION" bên dưới GHI ĐÈ)
+DO_DEFENSE  = False    # [1-session Qwen] TẮT: defense là rule_based, đã có từ S1 (defense.json). Bật lại nếu cần đo lại.
+DO_RQ3      = False     # [1-session Qwen] TẮT: RQ3 trên Qwen nhân-4 quá đắt; giữ RQ3 rule_based từ S1 (rq3_full.json).
+EVAL_VICTIM = "hf"          # victim cho ABLATION + RQ3: "rule_based"(nhanh nhưng TRƠ-poison: PDS/FPR≈0) |
+                            #   "hf"(Qwen THẬT, có tín hiệu thật; RẤT CHẬM -> dùng SCALE="qwen1s" hoặc "smoke").
+                            #   Train PPO + defense LUÔN rule_based (nhanh). Chỉ phần EVAL dùng Qwen.
+# Khi hf: giảm số arm ablation cho vừa ngân sách Qwen. rule_based: đủ 7 arm. hf: 3 arm cốt lõi RQ2.
+ABLATION_ARMS = (["cpa", "dream", "nopoison"] if EVAL_VICTIM == "hf"
+                 else ["cpa", "dream", "mcts", "heuristic", "random", "constant", "nopoison"])
 
 # ---- tính năng MỚI (4 TODO vừa wire vào source) ----
 DETECTOR_BACKEND  = "ensemble"  # "heuristic"|"roberta"|"gltr"|"ensemble" -> stealth/detection CÓ NGHĨA (cần transformers)
@@ -46,21 +50,84 @@ USE_CURRICULUM    = True          # train PPO curriculum 3 mức: random(A) -> c
 DEMO_LANGGRAPH    = True           # chạy 1 episode qua LangGraph StateGraph 4 node (Generator->Stealth->Publisher->Observer)
 
 # ---- quy mô ----
-SCALE = "medium"   # "smoke"=3 tgt/8 ep/12 turn | "medium"=8/15/20 | "full"=8/15/25 (~120 ep, CHẬM)
-_SCALES = {"smoke": (8_000, 3, 8, 12), "medium": (40_000, 8, 15, 20), "full": (60_000, 8, 15, 25)}
+SCALE = "qwen1s"   # "qwen1s"=4tgt/5ep/12turn (eval Qwen GỌN trong 1 session ~9-10h) | "smoke"=3/8/12 | "medium"=8/15/20 | "full"=8/15/25
+_SCALES = {"qwen1s": (8_000, 4, 5, 12), "smoke": (8_000, 3, 8, 12), "medium": (40_000, 8, 15, 20), "full": (60_000, 8, 15, 25)}
 PPO_STEPS, MAX_TARGETS, EPISODES, TURNS = _SCALES[SCALE]
-if EVAL_VICTIM == "hf" and SCALE != "smoke":
-    print(f"[warn] EVAL_VICTIM='hf' với SCALE='{SCALE}': ablation/RQ3 trên Qwen sẽ RẤT chậm "
-          f"(~{MAX_TARGETS*EPISODES} ep/arm × ~480s). Cân nhắc SCALE='smoke'.")
-# RQ1-LLM (victim Qwen) chạy RIÊNG budget nhỏ — KHÔNG theo SCALE: mỗi episode Qwen ~240-400s, nên
-# 8×15×2=240 ep ≈ 16h > 12h Kaggle. 3 tgt × 8 ep × 2 group = 48 ep là subset validate cơ chế (đủ).
-RQ1_TARGETS, RQ1_EPISODES, RQ1_TURNS = 3, 8, 15
+if EVAL_VICTIM == "hf" and SCALE not in ("smoke", "qwen1s"):
+    print(f"[warn] EVAL_VICTIM='hf' với SCALE='{SCALE}': ablation/RQ3 trên Qwen RẤT chậm "
+          f"(~{MAX_TARGETS*EPISODES} ep/arm × ~480s) -> NHIỀU session. Dùng 'qwen1s' (gọn 1 session) hoặc 'smoke'.")
+# RQ1-LLM (victim Qwen) chạy RIÊNG — khớp 'qwen1s' để vừa 1 session: 4×5×2×13 ≈ 520 lượt (~3.5h).
+# Muốn RQ1 lớn hơn (nhiều ep/target) thì để dành 1 session riêng cho RQ1.
+RQ1_TARGETS, RQ1_EPISODES, RQ1_TURNS = 4, 5, 12
 LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 # reactive detection heat: publish -> heat += gain; mỗi step heat *= decay; detection_risk = max(..., heat)
 HEAT = {"gain": 0.25, "decay": 0.6, "enabled": True}
 
+# ---- 12h Kaggle guard (xử lý "run quá 12 tiếng") -----------------------------------
+# Kaggle giết session GPU ở mốc 12h. 3 cơ chế để KHÔNG mất kết quả:
+#   (1) WALL_BUDGET_H : trước mỗi phase nặng, nếu sắp vượt budget -> BỎ QUA + lưu partial, đi tiếp.
+#   (2) RESUME        : phase đã có output JSON / model / gfcti trong RESUME_DIRS -> nạp lại, KHÔNG tính lại
+#                       -> chạy NỐI nhiều session: lần sau chỉ làm phần còn thiếu.
+#   (3) cache artifact: GFCTI jsonl (≈GFCTI_LIMIT lần gọi Qwen) + PPO model -> chỉ sinh 1 lần.
+# Tách 2 session khuyến nghị (mỗi cái < 12h):
+#   S1: DO_LLM_RQ1=False (mọi thứ rule_based) -> "Save Version"/Output. Mount output đó làm Dataset cho S2.
+#   S2: thêm đường dẫn dataset vào RESUME_DIRS, DO_LLM_RQ1=True. Các phase rule_based auto-skip nhờ RESUME.
+WALL_BUDGET_H  = 11.0      # dừng sạch trước 12h (giữ ~1h biên). 0 = tắt guard.
+RESUME         = True      # nạp lại output/model/gfcti đã có thay vì tính lại
+CKPT_DIR       = "/kaggle/working"          # nơi GHI json + model + gfcti cache
+RESUME_DIRS    = [CKPT_DIR]                  # nơi TÌM kết quả cũ; resume cross-session: thêm "/kaggle/input/<ds>"
+QWEN_LOG_EVERY = 1         # in heartbeat mỗi N lần gọi Qwen (1 = mỗi lần -> thấy model còn sống)
+EP_LOG_EVERY   = 25        # in heartbeat mỗi N episode cho phase rule_based (victim LLM luôn log từng ep)
+
+# ---- CHIA 2 SESSION (mỗi session < 12h) — chỉ cần đổi SESSION = 1 rồi = 2 -----------
+#  S1: chạy MỌI thứ rule_based (RL proof + defense + RQ3 + detector) + cache GFCTI/PPO; TẮT RQ1-Qwen.
+#      Xong -> "Save Version". Mở tab Output -> "New Dataset" từ /kaggle/working (đặt slug, vd 'cpa-s1').
+#  S2: notebook mới (hoặc clone) -> Add Data -> mount dataset đó -> sửa S1_DATASET cho khớp -> SESSION=2.
+#      Chỉ RQ1-Qwen chạy thật; RL/defense/RQ3/detector/GFCTI/PPO auto-skip nhờ RESUME (đọc từ S1_DATASET).
+SESSION    = 2                           # lần chạy Qwen: bật RQ1 + nối resume từ S1 (reuse GFCTI/PPO/detector)
+S1_DATASET = "/kaggle/input/cpa-s1"      # mount dataset output S1 vào đây để reuse (đỡ ~1.5h gen lại)
+if SESSION == 1:
+    DO_LLM_RQ1 = False                                  # S1 KHÔNG chạy victim Qwen (phần ~4h)
+elif SESSION == 2:
+    DO_LLM_RQ1 = True                                   # S2 chỉ chạy RQ1-Qwen
+# Nếu đã mount output cũ (S1_DATASET) -> thêm vào RESUME_DIRS để NỐI TIẾP. Dùng cho CẢ:
+#   - S2 (resume mọi thứ rule_based từ S1), VÀ
+#   - S1 chạy-lại nếu S1 lỡ quá 11h (mount partial output -> Run lại với SESSION=1 -> phần đã xong auto-skip).
+if os.path.isdir(S1_DATASET):
+    if S1_DATASET not in RESUME_DIRS: RESUME_DIRS.append(S1_DATASET)
+elif SESSION == 2:
+    print(f"[warn] S1_DATASET='{S1_DATASET}' KHÔNG tồn tại — sửa cho khớp slug Dataset đã mount, "
+          f"nếu không các phase rule_based sẽ chạy LẠI từ đầu.", flush=True)
+print(f"[session] SESSION={SESSION} | DO_LLM_RQ1={DO_LLM_RQ1} | RESUME_DIRS={RESUME_DIRS}", flush=True)
+
 def sh(*a, **k):
     print("+", " ".join(a)); return subprocess.run(a, check=False, **k)
+
+# ---- helpers: wall-clock budget + resume ------------------------------------------
+_T_START = time.time()
+def _elapsed_h(): return (time.time() - _T_START) / 3600.0
+def _have_budget(est_h, name):
+    if not WALL_BUDGET_H: return True
+    if _elapsed_h() + est_h > WALL_BUDGET_H:
+        print(f"[budget] BỎ QUA {name}: đã {_elapsed_h():.2f}h + ước {est_h:.1f}h > {WALL_BUDGET_H}h "
+              f"-> lưu partial & đi tiếp. Session sau (RESUME=True) sẽ làm nốt.", flush=True)
+        return False
+    return True
+def _find_ckpt(fname):
+    for d in RESUME_DIRS:
+        p = os.path.join(d, fname)
+        if os.path.exists(p): return p
+    return None
+def _resume_json(fname, key):
+    """RESUME: nạp output cũ vào report[key]; True = phase đã xong -> bỏ qua."""
+    if not RESUME: return False
+    p = _find_ckpt(fname)
+    if not p: return False
+    try:
+        with open(p) as f: report[key] = json.load(f)
+        print(f"[resume] {key}: dùng {p} (bỏ qua tính lại)", flush=True); return True
+    except Exception as e:
+        print(f"[resume] {key}: đọc {p} lỗi ({e}); tính lại", flush=True); return False
 
 # 1. clone branch (idempotent) -------------------------------------------------------
 if not os.path.isdir(REPO_DIR):
@@ -299,17 +366,21 @@ import cpa.victim.providers as _prov
 import cpa.victim.llm_victim as _lv
 _HF_CACHE = {}
 class _HFProvider(_prov.LLMProvider):
+    _N = 0; _TOK = 0; _T = 0.0          # [log] đếm/định-thời MỌI lần gọi Qwen (heartbeat -> không "im ru")
     def __init__(self, cfg):
         super().__init__(cfg)
         self.model_name = cfg.get("model") or "Qwen/Qwen2.5-7B-Instruct"
         if self.model_name not in _HF_CACHE:
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            print(f"[qwen] nạp {self.model_name} 4-bit (1 lần, cache module-level)...", flush=True)
+            _t = time.time()
             bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                      bnb_4bit_compute_dtype=torch.float16)
             tok = AutoTokenizer.from_pretrained(self.model_name)
             mdl = AutoModelForCausalLM.from_pretrained(self.model_name, quantization_config=bnb,
                                                        device_map="auto")
             _HF_CACHE[self.model_name] = (mdl, tok)
+            print(f"[qwen] nạp xong trong {time.time()-_t:.0f}s", flush=True)
         self.model, self.tokenizer = _HF_CACHE[self.model_name]
     def complete(self, system, user):
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -318,17 +389,51 @@ class _HFProvider(_prov.LLMProvider):
         kw = dict(max_new_tokens=self.max_tokens, pad_token_id=self.tokenizer.eos_token_id)
         if self.temperature and self.temperature > 0: kw.update(do_sample=True, temperature=self.temperature)
         else: kw["do_sample"] = False
+        _t = time.time()
         with torch.no_grad(): out = self.model.generate(**inputs, **kw)
+        dt = time.time() - _t; n_new = int(out.shape[1] - inputs["input_ids"].shape[1])
+        c = _HFProvider; c._N += 1; c._TOK += n_new; c._T += dt
+        if c._N <= 3 or c._N % QWEN_LOG_EVERY == 0:
+            print(f"[qwen] call #{c._N}: +{n_new} tok / {dt:.1f}s ({n_new/max(dt,1e-9):.1f} tok/s) "
+                  f"| tích luỹ {c._T/60:.1f} phút, {c._TOK} tok", flush=True)
         return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 _orig_make_provider = _prov.make_provider
 def _make_provider(cfg):
     if cfg.get("provider") in ("hf", "transformers", "local-hf"): return _HFProvider(cfg)
     return _orig_make_provider(cfg)
 _prov.make_provider = _make_provider; _lv.make_provider = _make_provider
-print("[patch] batch-embed + cleanup + cached-embed + stochastic-eval + reactive-heat(obs23) + Constant + HFProvider ON")
+
+# (6) [log] per-episode heartbeat + ETA — phase rule_based & RQ1-Qwen không còn "im ru" hàng giờ.
+#     Bọc run_one ở CẢ run_episode lẫn run_rq (run_rq1/3 + defense dùng binding riêng của run_rq).
+import experiments.run_rq as _rq
+_EP = {"n": 0, "tot": 0, "t0": time.time(), "label": ""}
+def _phase(label, total=0):
+    _EP.update(n=0, tot=total, t0=time.time(), label=label)
+    print(f"\n[phase] >>> {label}" + (f" — {total} episode dự kiến" if total else ""), flush=True)
+_raw_run_one = _re.run_one
+def _run_one_logged(cfg, target, group, policy_name, turns, **kw):
+    i = _EP["n"] + 1; _EP["n"] = i
+    is_llm = (cfg.get("victim") or {}).get("provider", "rule_based") not in ("rule_based", "tda")
+    t0 = time.time(); r = _raw_run_one(cfg, target, group, policy_name, turns, **kw)
+    dt = time.time() - t0; tot = time.time() - _EP["t0"]; avg = tot / i
+    if is_llm or i == 1 or i % EP_LOG_EVERY == 0:
+        nlab = f"{i}/{_EP['tot']}" if _EP["tot"] else f"{i}"
+        eta = f", ETA {avg*(_EP['tot']-i)/60:.1f}m" if _EP["tot"] else ""
+        print(f"[{_EP['label'] or 'ep'}] ep {nlab} {target.get('id','?')}/{group}/{policy_name} "
+              f"{dt:.0f}s (avg {avg:.0f}s, tổng {tot/60:.1f}m{eta})", flush=True)
+    return r
+_re.run_one = _run_one_logged; _rq.run_one = _run_one_logged
+print("[patch] batch-embed + cleanup + cached-embed + stochastic-eval + reactive-heat(obs23) + Constant "
+      "+ HFProvider + qwen-log + per-episode-log + budget/resume ON")
 # ====================================================================================
 
 # 5. config cơ sở (victim rule_based cho train/ablation RL) --------------------------
+# [TẠI SAO default_gpu.yaml để victim=rule_based?] File yaml này CHỈ được nạp bởi train_ppo /
+# train_ppo_curriculum (mục 6A). Train RL cần HÀNG CHỤC NGHÌN bước victim.step nên victim PHẢI là
+# rule_based — proxy nhanh, tất định, không tốn GPU/credit; victim Qwen thật sẽ khiến train mất nhiều
+# NGÀY. Victim Qwen THẬT chỉ được dùng khi ĐÁNH GIÁ: RQ1 (cfg_llm, mục 6B) và — nếu EVAL_VICTIM="hf" —
+# ablation/RQ3 (cfg_eval). Hai cái đó là bản deepcopy TRONG RAM, KHÔNG ghi ra yaml. Vậy đây là chủ ý,
+# không phải bug: train trên rule_based, validate cơ chế trên Qwen.
 cfg = load_cfg("config/default.yaml")
 cfg["victim"]["provider"] = "rule_based"
 cfg["cti_store"]["gpu_embed"] = USE_GPU
@@ -339,14 +444,23 @@ cfg.setdefault("defense", {})["guarantee_real_k"] = GUARANTEE_REAL_K  # chống 
 if USE_LLM_GENERATOR:                                                # sinh fake CTI bằng LLM thật (fallback template)
     cfg["generator"]["backend"] = "llm_local"; cfg["generator"]["llm_model"] = LLM_MODEL
 elif USE_GFCTI_DATASET:                                              # poison pool từ dataset thật (clone tự động)
-    if GFCTI_SOURCE == "finance":                                   # render real + Qwen sinh fake tài chính
+    _gf = "data/gfcti_finance.jsonl"
+    _gf_cache = _find_ckpt("gfcti_finance.jsonl")                    # cache: GFCTI = GFCTI_LIMIT lần gọi Qwen
+    if RESUME and _gf_cache and not os.path.exists(_gf):
+        os.makedirs("data", exist_ok=True); shutil.copy(_gf_cache, _gf)
+        print(f"[resume] GFCTI <- {_gf_cache} (bỏ qua sinh lại bằng Qwen)", flush=True)
+    if os.path.exists(_gf):                                          # đã có (cache/lần trước) -> dùng luôn
+        print(f"[cache] dùng {_gf} có sẵn (bỏ qua sinh GFCTI)", flush=True)
+    elif GFCTI_SOURCE == "finance":                                 # render real + Qwen sinh fake tài chính
         if not os.path.isdir("data/raw/Finance_CTI"):
             sh("git", "clone", "--depth", "1", "https://github.com/anotherme13/Finance_CTI",
                "data/raw/Finance_CTI")
         sh(sys.executable, "-m", "pip", "install", "-q", "bitsandbytes")   # Qwen 4-bit cho gen
+        print(f"[gfcti] sinh {GFCTI_LIMIT} fake bằng Qwen (log '[gen_gfcti_finance] N/total' mỗi 50)...",
+              flush=True)
         sh(sys.executable, "-m", "data.gen_gfcti_finance",
            "--src", "data/raw/Finance_CTI/CTI_extract/finance.json",
-           "--out", "data/gfcti_finance.jsonl", "--limit", str(GFCTI_LIMIT))
+           "--out", _gf, "--limit", str(GFCTI_LIMIT))
     else:                                                           # Deepfake-H GFCTI (CTI_long.xlsx có sẵn fake)
         if not os.path.isdir("data/raw/GFCTI"):
             sh("git", "clone", "--depth", "1",
@@ -354,9 +468,12 @@ elif USE_GFCTI_DATASET:                                              # poison po
                "data/raw/GFCTI")
         sh(sys.executable, "-m", "pip", "install", "-q", "openpyxl")
         sh(sys.executable, "-m", "data.build_gfcti",
-           "--src", "data/raw/GFCTI/dataset/CTI_long.xlsx", "--out", "data/gfcti_finance.jsonl")
-    cfg["generator"]["backend"] = "dataset"; cfg["generator"]["dataset_path"] = "data/gfcti_finance.jsonl"
-GPU_CFG = "/kaggle/working/default_gpu.yaml"
+           "--src", "data/raw/GFCTI/dataset/CTI_long.xlsx", "--out", _gf)
+    if os.path.exists(_gf) and CKPT_DIR:                            # lưu cache để session sau resume
+        try: shutil.copy(_gf, os.path.join(CKPT_DIR, "gfcti_finance.jsonl"))
+        except Exception: pass
+    cfg["generator"]["backend"] = "dataset"; cfg["generator"]["dataset_path"] = _gf
+GPU_CFG = "/kaggle/working/default_gpu.yaml"   # = config TRAIN PPO (victim rule_based). KHÔNG phải config eval.
 with open(GPU_CFG, "w") as f: yaml.safe_dump(cfg, f, sort_keys=False)
 
 # Victim dùng cho EVALUATION (ablation + RQ3). Train PPO + defense vẫn xài `cfg` (rule_based) cho nhanh.
@@ -367,41 +484,77 @@ if EVAL_VICTIM == "hf":
 print(f"[cfg] eval victim = {cfg_eval['victim']['provider']} | scale={SCALE} "
       f"({MAX_TARGETS} tgt × {EPISODES} ep × {TURNS} turn)")
 
+os.makedirs(CKPT_DIR, exist_ok=True)
 report = {}
+cpa_model = None                                                      # [budget] luôn định nghĩa -> RQ3 không NameError nếu RL proof bị skip
+_nt = MAX_TARGETS if MAX_TARGETS > 0 else len(cfg_eval["victim"]["targets"])   # số target thực dùng (cho ETA)
+# Tách output eval THEO victim: rl_proof/rq3 đổi tên khi hf -> mount lại dataset S1 (rule_based) vẫn REUSE
+# GFCTI + PPO + detector + defense (tên không đổi), nhưng KHÔNG resume nhầm số rule_based cho phần Qwen.
+_SUF = "_hf" if EVAL_VICTIM == "hf" else ""
 
 # 5b. DETECTOR benchmark: AUC real-vs-fake (chứng minh detector phân biệt được poison vs CTI thật) -
 # Chạy mỗi generator 1 arm: template (mặc định) + llm_local (nếu DET_BENCH_LLM) để so AUC.
 # template thường ra AUC<0.5 (đảo) vì text đầy mã/ID làm GLTR đọc nhầm thành "người viết";
 # llm_local (prose trôi chảy) là phép thử xem detector có thật sự phân biệt được poison không.
-if RUN_DET_BENCHMARK and DETECTOR_BACKEND != "heuristic":
+if RUN_DET_BENCHMARK and DETECTOR_BACKEND != "heuristic" and _have_budget(0.5, "detector_benchmark"):
     gens = ["template"] + (["llm_local"] if DET_BENCH_LLM else [])
-    report["detector_benchmark"] = {}
+    report.setdefault("detector_benchmark", {})
     for gen in gens:
+        _dbj = f"experiments/detector_benchmark_{gen}.json"
+        _dbc = _find_ckpt(f"detector_benchmark_{gen}.json")             # resume: dùng kết quả cũ nếu có
+        if RESUME and _dbc:
+            try:
+                with open(_dbc) as f: report["detector_benchmark"][gen] = json.load(f)
+                print(f"[resume] detector_benchmark[{gen}] <- {_dbc}", flush=True); continue
+            except Exception: pass
+        if gen == "llm_local" and not _have_budget(0.3, "detector_benchmark[llm_local]"):
+            continue   # arm Qwen — bỏ nếu hết budget (template arm vẫn đủ kết luận)
         print(f"\n=== Detector benchmark ({DETECTOR_BACKEND}, gen={gen}) — AUC real vs fake ===")
         det_n = "200" if gen == "template" else "60"   # llm_local sinh n lần gọi Qwen -> giảm cho nhanh
         sh(sys.executable, "-m", "experiments.benchmark_detector",
            "--backend", DETECTOR_BACKEND, "--n", det_n, "--generator", gen)
         try:
-            with open(f"experiments/detector_benchmark_{gen}.json") as f:
+            with open(_dbj) as f:
                 report["detector_benchmark"][gen] = json.load(f)
             print(f"detector_benchmark[{gen}]:", report["detector_benchmark"][gen])
+            if CKPT_DIR:                                                # cache cho session sau
+                try: shutil.copy(_dbj, os.path.join(CKPT_DIR, f"detector_benchmark_{gen}.json"))
+                except Exception: pass
         except Exception as e:
-            print(f"[warn] đọc detector_benchmark_{gen}.json lỗi:", e)
+            print(f"[warn] đọc {_dbj} lỗi:", e)
+
+# 6A-pre. RESUME RL proof: nếu đã có CẢ model + rl_proof.json -> nạp lại, bỏ qua train + ablation ---
+_RLP_RESUMED = False
+if DO_RL_PROOF and RESUME and _find_ckpt("cpa_ppo.zip") and _find_ckpt(f"rl_proof{_SUF}.json"):
+    from stable_baselines3 import PPO
+    cpa_model = PPO.load(_find_ckpt("cpa_ppo.zip")[:-4])   # model vẫn cần cho RQ3 arm 'cpa'
+    _resume_json(f"rl_proof{_SUF}.json", "rl_proof")
+    print(f"[resume] RL proof: nạp model + rl_proof{_SUF}.json (bỏ qua train + ablation)", flush=True)
+    _RLP_RESUMED = True
 
 # 6A. RL PROOF: train reactive + ablation + obs-perturbation -------------------------
-if DO_RL_PROOF:
+if DO_RL_PROOF and not _RLP_RESUMED and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rl_proof"):
     from stable_baselines3 import PPO
     from experiments.run_episode import run_one
 
-    print("\n=== Train PPO trên env REACTIVE (heat ON)" + (" — CURRICULUM 3 mức" if USE_CURRICULUM else "") + " ===")
-    t0 = time.time()
-    if USE_CURRICULUM:   # #7: random(A) -> context_aware(B) -> multi_turn, chuyển tiếp policy giữa các mức
-        out = train_ppo_curriculum(GPU_CFG, total_timesteps=PPO_STEPS, out="/kaggle/working/cpa_ppo",
-                                   turns=TURNS, device=DEVICE)
+    _ppo_out = "/kaggle/working/cpa_ppo"
+    _ppo_ckpt = _find_ckpt("cpa_ppo.zip")
+    if RESUME and _ppo_ckpt:                                          # cache: khỏi train lại PPO ở session sau
+        cpa_model = PPO.load(_ppo_ckpt[:-4])
+        print(f"[resume] PPO model <- {_ppo_ckpt} (bỏ qua train)", flush=True)
     else:
-        out = train_ppo(GPU_CFG, timesteps=PPO_STEPS, out="/kaggle/working/cpa_ppo", turns=TURNS, device=DEVICE)
-    cpa_model = PPO.load(out)
-    print(f"PPO {time.time()-t0:.0f}s -> {out}.zip")
+        print("\n=== Train PPO trên env REACTIVE (heat ON)" + (" — CURRICULUM 3 mức" if USE_CURRICULUM else "") + " ===")
+        t0 = time.time()
+        if USE_CURRICULUM:   # #7: random(A) -> context_aware(B) -> multi_turn, chuyển tiếp policy giữa các mức
+            out = train_ppo_curriculum(GPU_CFG, total_timesteps=PPO_STEPS, out=_ppo_out,
+                                       turns=TURNS, device=DEVICE)
+        else:
+            out = train_ppo(GPU_CFG, timesteps=PPO_STEPS, out=_ppo_out, turns=TURNS, device=DEVICE)
+        cpa_model = PPO.load(out)
+        print(f"PPO {time.time()-t0:.0f}s -> {out}.zip")
+        if CKPT_DIR and os.path.abspath(os.path.dirname(_ppo_out)) != os.path.abspath(CKPT_DIR):
+            try: shutil.copy(_ppo_out + ".zip", os.path.join(CKPT_DIR, "cpa_ppo.zip"))
+            except Exception: pass
 
     def _summ(key, rows):
         xs = [float(r[key]) for r in rows]
@@ -411,9 +564,11 @@ if DO_RL_PROOF:
     arms = [("cpa", "cpa", cpa_model), ("dream", "dream", None), ("mcts", "mcts", None),
             ("heuristic", "cpa", None), ("random", "random", None), ("constant", "constant", None),
             ("nopoison", "none", None)]
+    arms = [a for a in arms if a[0] in ABLATION_ARMS]   # trim theo ABLATION_ARMS (hf -> chỉ 3 arm cốt lõi)
     targets = cfg_eval["victim"]["targets"][:MAX_TARGETS]
     ablation = {}
     print(f"\n=== Ablation (group B, reactive, victim={cfg_eval['victim']['provider']}) ===")
+    _phase("ablation", len(arms) * len(targets) * EPISODES)
     for label, pname, model in arms:
         rows = [run_one(cfg_eval, tgt, "B", pname, TURNS, seed=s, cpa_model=model)
                 for tgt in targets for s in range(EPISODES)]
@@ -468,7 +623,7 @@ if DO_RL_PROOF:
     report["rl_proof"] = {"ablation": ablation, "verdict_stealth": verdict_stealth,
                           "obs_perturbation": perturb, "verdict_obs": verdict_obs}
     print("\nverdict_stealth:", verdict_stealth, "\nverdict_obs:", verdict_obs)
-    with open("/kaggle/working/rl_proof.json", "w") as f: json.dump(report["rl_proof"], f, indent=2)
+    with open(f"/kaggle/working/rl_proof{_SUF}.json", "w") as f: json.dump(report["rl_proof"], f, indent=2)
 
 # 6A1b. LangGraph orchestrator demo: 1 episode qua StateGraph 4 node (#7 part 1) -----
 if DEMO_LANGGRAPH:
@@ -488,9 +643,10 @@ if DEMO_LANGGRAPH:
         print("[warn] LangGraph demo lỗi (bỏ qua, không ảnh hưởng phần khác):", repr(e))
 
 # 6A2. DEFENSE ablation: verifier OFF/ON + chống feed-starvation ---------------------
-if DO_DEFENSE:
+if DO_DEFENSE and not _resume_json("defense.json", "defense") and _have_budget(2.0, "defense"):
     from experiments.run_rq import run_defense_ablation
     print("\n=== Defense ablation (verifier OFF/ON, guarantee_real_k) ===")
+    _phase("defense", _nt * EPISODES * 2)
     t0 = time.time()
     def_rep = run_defense_ablation(cfg, EPISODES, TURNS, MAX_TARGETS)
     report["defense"] = def_rep
@@ -501,25 +657,28 @@ if DO_DEFENSE:
 # 6A3. RQ3: two-way ANOVA group(A/B) × policy(dream/cpa) trên max_pds + stealth (lever nào mạnh) -
 # Dùng victim rule_based (nhanh) — ANOVA đo tương tác CTI-context × policy, không cần LLM thật.
 # Tái dùng PPO đã train ở 6A nếu có (arm "cpa"); nếu DO_RL_PROOF tắt thì "cpa" = heuristic.
-if DO_RQ3:
+if DO_RQ3 and not _resume_json(f"rq3_full{_SUF}.json", "rq3") and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq3"):
     from experiments.run_rq import run_rq3
     print("\n=== RQ3 (two-way ANOVA: CTI-context A/B × policy dream/cpa) ===")
+    _phase("rq3", _nt * EPISODES * 2 * 2)   # A/B × dream/cpa
     t0 = time.time()
     _rq3_model = cpa_model if DO_RL_PROOF else None
     rq3 = run_rq3(cfg_eval, EPISODES, TURNS, MAX_TARGETS, cpa_model=_rq3_model)
     report["rq3"] = rq3
     print(f"RQ3 {time.time()-t0:.0f}s")
     print(json.dumps(rq3, indent=2)[:1500])
-    with open("/kaggle/working/rq3_full.json", "w") as f: json.dump(rq3, f, indent=2)
+    with open(f"/kaggle/working/rq3_full{_SUF}.json", "w") as f: json.dump(rq3, f, indent=2)
 
-# 6B. LLM RQ1: victim Qwen thật, subset A vs B ---------------------------------------
-if DO_LLM_RQ1:
-    print(f"\n=== RQ1 với victim LLM thật ({LLM_MODEL}) — CHẬM ===")
+# 6B. LLM RQ1: victim Qwen thật, subset A vs B — PHẦN CHẬM NHẤT (mỗi episode Qwen ~240-400s) --------
+# Đặt CUỐI cùng: nếu hết budget 12h ở đây, mọi phase rule_based ĐÃ lưu xong -> session sau RESUME chỉ chạy RQ1.
+if DO_LLM_RQ1 and not _resume_json("rq1_llm.json", "rq1_llm") and _have_budget(5.0, "rq1_llm"):
+    print(f"\n=== RQ1 với victim LLM thật ({LLM_MODEL}) — CHẬM (xem heartbeat [qwen] / [rq1-llm]) ===")
     cfg_llm = copy.deepcopy(cfg)
     cfg_llm["victim"]["provider"] = "hf"
     cfg_llm["victim"]["model"] = LLM_MODEL
     cfg_llm["victim"]["temperature"] = 0.7
     cfg_llm["victim"]["max_tokens"] = 512
+    _phase("rq1-llm", RQ1_TARGETS * RQ1_EPISODES * 2)   # A/B
     t0 = time.time()
     rq1 = run_rq1(cfg_llm, RQ1_EPISODES, RQ1_TURNS, RQ1_TARGETS)   # budget riêng (Qwen chậm, không scale)
     print(f"RQ1-LLM {time.time()-t0:.0f}s")
@@ -528,4 +687,8 @@ if DO_LLM_RQ1:
     with open("/kaggle/working/rq1_llm.json", "w") as f: json.dump(rq1, f, indent=2)
 
 with open("/kaggle/working/results.json", "w") as f: json.dump(report, f, indent=2)
-print("\nDONE. Files: /kaggle/working/{results,rl_proof,defense,rq3_full,rq1_llm}.json + experiments/detector_benchmark_*.json")
+print(f"\n[done] elapsed {_elapsed_h():.2f}h | phases có trong report: {sorted(report)}", flush=True)
+print(f"DONE. Files: /kaggle/working/results.json, rl_proof{_SUF}.json, rq3_full{_SUF}.json, defense.json, "
+      f"rq1_llm.json + experiments/detector_benchmark_*.json  (victim eval = {EVAL_VICTIM})")
+print("Nếu thiếu phase nào (do hết budget/timeout): Save Version -> mount output làm Dataset -> thêm vào "
+      "RESUME_DIRS -> Run lại (RESUME=True bỏ qua phần đã xong).")
