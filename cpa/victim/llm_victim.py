@@ -33,10 +33,12 @@ class LLMVictim(VictimAgent):
 
     # --- TDA bookkeeping --------------------------------------------------
     def _assess_cti_evidence(self, cti_records: List) -> float:
-        """Mean evidence confidence the victim assigns to the retrieved CTI.
+        """Max evidence confidence the victim assigns to the retrieved CTI.
 
-        `cti_records` may be CTIRecord objects (have .source_channel) or plain strings.
-        With no provenance verification, external CTI reads as PLAUSIBLE+ and lifts E.
+        Uses MAX (not mean) to match rule_based.py: an agent without provenance checks
+        anchors on the most authoritative-looking report it sees — real CTI alongside it
+        does not lower that trust. Consistent aggregation is required so results transfer
+        between the two victim implementations (P1.5 fix).
         """
         if not cti_records:
             return tda.EVIDENCE_LEVELS["SPECULATIVE"]
@@ -44,7 +46,7 @@ class LLMVictim(VictimAgent):
         for r in cti_records:
             channel = getattr(r, "source_channel", "mock-local")
             vals.append(tda.evidence_from_source(channel))
-        return float(np.mean(vals))
+        return float(max(vals))
 
     def _current_tdi(self, evidence: float) -> tda.TDIScore:
         horizon = max(0.0, 1.0 - self._turn / max(self.cfg.get("horizon_turns", 20), 1))

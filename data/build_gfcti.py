@@ -175,7 +175,10 @@ def normalize_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "real_cti": "" if is_fake else flat_text,
             "fake_cti": flat_text if is_fake else "",
             "topic": topic,
-            "target_relevance": "",                 # GFCTI has no relevance label; set at pool-build time
+            # GFCTI flat release has no per-row relevance label; default to "low" so the
+            # pool-builder assigns these records to Group A (generic). Individual pool overrides
+            # can promote them at build time.
+            "target_relevance": "low",
             "label": "fake" if is_fake else "real",
             "metadata": {"entities": entities, "length": len(flat_text),
                          "readability": round(flesch_reading_ease(flat_text), 4)},
@@ -398,8 +401,14 @@ def build_gfcti(
         print(msg, file=sys.stderr)
         if strict:
             sys.exit(1)
-        print("[GFCTI] Source absent — emitting SYNTHETIC placeholder sample (5 rows).", file=sys.stderr)
-        print("[GFCTI] These records are clearly marked synthetic=True in metadata.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print("WARNING: GFCTI source absent — using SYNTHETIC PLACEHOLDER (5 rows).", file=sys.stderr)
+        print("  All records are marked metadata.synthetic=True.", file=sys.stderr)
+        print("  Results derived from this data are NOT representative of real CTI.", file=sys.stderr)
+        print("  Provide the real GFCTI source file for valid experiments.", file=sys.stderr)
+        print("=" * 70, file=sys.stderr)
+        print("", file=sys.stderr)
         records = make_synthetic_sample()
     else:
         raw_rows = load_source(src)
