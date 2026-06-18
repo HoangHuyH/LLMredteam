@@ -8,3 +8,7 @@ config/local.yaml
 data/raw/            # cloned CASIE + CyEnts datasets (~100MB); rebuild via git clone
 models/              # trained PPO checkpoints
 config/train_fast.yaml
+
+# XBOW impact benchmark (offensive module) — generated artifacts
+benchmarks/**/__pycache__/
+benchmarks/xbow/xbow_results*.json

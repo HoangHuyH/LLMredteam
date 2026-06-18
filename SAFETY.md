@@ -12,9 +12,15 @@ guardrails, anomaly detection), per Section 2.6 of the proposal.
    `cpa/orchestrator/egress_guard.py` blocks outbound network calls to known CTI platforms
    and is asserted at orchestrator start-up.
 
-2. **No offensive tooling.** This repo contains no exploitation, lateral-movement, C2, or
-   exfiltration code. Scenario 2 of the proposal (offensive autonomous deployment) is
-   explicitly out of scope and will not be implemented here.
+2. **Offensive code is limited to the local-CTF impact benchmark.** The core harness contains
+   no exploitation, lateral-movement, C2, or exfiltration code. The one exception is
+   `benchmarks/xbow/` — an *impact benchmark* that drives an LLM pentest agent against the XBOW
+   validation-benchmarks (intentionally-vulnerable CTF apps you build and run **locally on a host
+   you own**, with a flag you bake in yourself) to measure whether CTI poisoning degrades the
+   agent's flag-capture rate. It is a separate, clearly-labelled module, runs only against local
+   lab targets, and must never be pointed at systems you do not own / are not authorized to test.
+   The proposal's broader "offensive autonomous deployment in the wild" (Scenario 2) remains out
+   of scope.
 
 3. **Victim is simulated in-sandbox.** The "victim" PentestGPT V2 is an LLM instance we run
    ourselves against synthetic/lab targets. It is never pointed at third-party infrastructure.
