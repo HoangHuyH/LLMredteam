@@ -94,7 +94,8 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
             trust_threshold=dcfg.get("trust_threshold", 0.5),
             detector_fn=detector_fn)
 
-    env_cfg = {"reward_weights": cfg["mdp"]["reward_weights"], "ekg_dim": 8, "max_turns": turns}
+    env_cfg = {"reward_weights": cfg["mdp"]["reward_weights"], "ekg_dim": 8, "max_turns": turns,
+               "heat_gain": cfg.get("heat_gain", 0.25), "heat_decay": cfg.get("heat_decay", 0.6)}
     env = PoisoningEnv(victim, store, publisher, pool, target,
                        ground_truth_ids, embed_fn, detector_fn, env_cfg,
                        ceakg=ceakg, verifier=verifier)

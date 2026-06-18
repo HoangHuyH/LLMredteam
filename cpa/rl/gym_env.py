@@ -30,7 +30,7 @@ from cpa.mdp.action import ACTION_SPACE
 from cpa.rl.policy import decode_action
 from experiments.backends import make_embed_fn, make_detector_fn, make_store_embed_fn
 
-_STATE_DIM = 8 + 7 + 7  # e_kg(8) + v_obs(7) + h_hist(7)
+_STATE_DIM = 8 + 7 + 7 + 1  # e_kg(8) + v_obs(7) + h_hist(7) + pressure(1)
 
 
 def _make_gym_base():
@@ -86,7 +86,10 @@ class PoisoningGymEnv(_make_gym_base()):
         ceakg = CEAKG()
         techs = [t for t in target.get("profile", "").replace(",", " ").split() if len(t) > 3]
         ceakg.add_target(target["id"], techs)
-        env_cfg = {"reward_weights": self.cfg["mdp"]["reward_weights"], "ekg_dim": 8, "max_turns": self.turns}
+        env_cfg = {"reward_weights": self.cfg["mdp"]["reward_weights"], "ekg_dim": 8,
+                   "max_turns": self.turns,
+                   "heat_gain": self.cfg.get("heat_gain", 0.25),
+                   "heat_decay": self.cfg.get("heat_decay", 0.6)}
         return PoisoningEnv(victim, store, publisher, pool, target, gt,
                             self._embed, self._detect, env_cfg, ceakg=ceakg)
 

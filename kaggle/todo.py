@@ -1,9 +1,8 @@
 # =====================================================================================
-# CPA — single-cell Kaggle runner (KHÔNG cần push GitHub). Mọi cải tiến áp bằng monkeypatch:
-#   GPU batch-embed + store cleanup + cached embed_fn + stochastic CPA eval
-#   + HF local victim (Qwen2.5-7B 4-bit) + reactive detection-heat env + obs 22->23 + ConstantPolicy
+# CPA — single-cell Kaggle runner. git clone branch kaggle-run rồi chạy.
+# Monkeypatches còn lại (tối thiểu): GPU batch-embed + cached embed_fn + stochastic CPA
+#   + HF logging heartbeat. Reactive heat + ConstantPolicy + HFProvider đã vào package.
 # SETUP: Accelerator = GPU **T4 x2** (KHÔNG P100), Internet = ON. Copy CẢ file vào 1 cell rồi Run.
-# Hai thí nghiệm bật/tắt bằng cờ DO_RL_PROOF / DO_LLM_RQ1 ở dưới.
 # =====================================================================================
 # CAPSTONE — CHƯA LÀM (TODO so với proposal). File này mới lo: RQ1 (victim Qwen thật) +
 # RQ2 (RL reactive + ablation + obs-perturbation) + stats hợp lệ — ở quy mô SMOKE.
@@ -231,172 +230,41 @@ def _cached_embed(cfg):
     return _EMBED_CACHE[key]
 _re.make_embed_fn = _cached_embed
 
-# (3) reactive detection-heat + obs 22->23 (pressure) --------------------------------
-from cpa.observer.parser import parse_turn, observation_vector
-from cpa.metrics.effectiveness import planning_deviation_score, false_positive_rate
-from cpa.mdp.reward import compute_reward, RewardComponents
-import cpa.mdp.env as _envmod
+# (3) Reactive heat + 23-dim obs — ĐÃ VÀO PACKAGE (cpa/mdp/env.py + cpa/mdp/state.py).
+#     Truyền heat config qua cfg thay vì monkeypatch env.reset/step.
+#     _STATE_DIM = 23 đã cố định trong cpa/rl/gym_env.py.
+import cpa.mdp.env as _envmod   # chỉ import để lấy CHANNEL_DETECTION_RISK cho các module khác
 CHANNEL_DETECTION_RISK = _envmod.CHANNEL_DETECTION_RISK
 
-def _build_state23(ekg, vobs, history, history_window=5, pressure=0.0):
-    if history:
-        hhist = np.mean(np.stack(history[-history_window:], axis=0), axis=0)
-    else:
-        hhist = np.zeros_like(vobs)
-    return np.concatenate([np.asarray(ekg, dtype=np.float32), np.asarray(vobs, dtype=np.float32),
-                           np.asarray(hhist, dtype=np.float32), np.asarray([pressure], dtype=np.float32)])
-
-def _env_reset(self):
-    self.victim.reset(self.target)
-    self._history = []; self._published = 0; self._heat = 0.0
-    self._baseline_emb = self.embed(self.victim.baseline_plan(self.target))
-    return _build_state23(self._ekg(), np.zeros(7, dtype=np.float32), self._history, pressure=0.0)
-
-def _env_step(self, action):
-    variant = self.pool[action.variant_id % len(self.pool)]
-    do_publish = action.frequency >= self.cfg.get("publish_threshold", 0.5)
-    if do_publish:
-        self.publisher.publish(variant, channel_id=action.channel_id)
-        self._published += 1
-        if self.ceakg is not None:
-            relevance = {"low": 0.3, "medium": 0.6, "high": 0.9}[variant.target_relevance.value]
-            self.ceakg.add_poison(variant.variant_id or 0,
-                                  variant.entities.cves + variant.entities.vulnerabilities, relevance)
-    profile = self.target.get("profile", "")
-    if hasattr(self.store, "query_scored"):
-        scored = self.store.query_scored(profile, k=5)
-    else:
-        scored = [(r, None) for r in self.store.query(profile, k=5)]
-    cti_context = []
-    for r, s in scored:
-        try: r.retrieval_score = s
-        except Exception: pass
-        cti_context.append(r)
-    # chống FEED-STARVATION (chỉ path defense, gate theo verifier): đảm bảo >=guarantee_real_k CTI thật
-    # trong feed — nếu không, real_retention_in_feed = null vì poison Group B quét sạch top-k.
-    if self.verifier is not None:
-        guarantee = self.cfg.get("guarantee_real_k", 2)
-        real_in = sum(1 for r in cti_context if not r.is_poison)
-        if real_in < guarantee:
-            ids_in = {id(r) for r in cti_context}; cand = []
-            if hasattr(self.store, "query_scored"):
-                for r, s in self.store.query_scored(profile, k=20):
-                    if not r.is_poison and id(r) not in ids_in:
-                        try: r.retrieval_score = s
-                        except Exception: pass
-                        cand.append(r)
-            seen = ids_in | {id(r) for r in cand}
-            for r in self.store.all():
-                if not r.is_poison and id(r) not in seen: cand.append(r); seen.add(id(r))
-            cand.sort(key=lambda r: getattr(r, "retrieval_score", None) or 0.0, reverse=True)
-            k = len(cti_context) or 5; inject = cand[:guarantee - real_in]
-            poison = sorted([r for r in cti_context if r.is_poison],
-                            key=lambda r: getattr(r, "retrieval_score", None) or 0.0)
-            overflow = len(cti_context) + len(inject) - k
-            drop = {id(r) for r in poison[:max(overflow, 0)]}
-            cti_context = [r for r in cti_context if id(r) not in drop] + inject
-    if self.verifier is not None:
-        corpus = self.store.all(); kept = []
-        for r in cti_context:
-            blocked = self.verifier.verify(r, corpus).trust < self.verifier.threshold
-            self.filter_stats[("poison_" if r.is_poison else "real_") + ("blocked" if blocked else "passed")] += 1
-            if not blocked: kept.append(r)
-        cti_context = kept
-    turn = self.victim.step(cti_context)
-    parsed = parse_turn(turn, self.gt)
-    vobs = observation_vector(parsed); self._history.append(vobs)
-    pds = planning_deviation_score(self._baseline_emb, self.embed(turn.plan_text))
-    # FPR sống: gộp reported_vulns có cấu trúc + CVE victim phun ra output (parsed["cves"]) — adopt
-    # CVE giả -> false positive (khớp env.py repo + spec 3.2 logging wrapper). Không còn FPR=0 cứng.
-    reported = list(turn.reported_vulns) + [{"cve": c} for c in parsed.get("cves", [])]
-    fpr = false_positive_rate(reported, self.gt)
-    impact = 0.6 * pds + 0.4 * fpr
-    heat_on = HEAT.get("enabled", True)
-    if heat_on:
-        self._heat *= float(HEAT.get("decay", 0.6))
-        if do_publish: self._heat = min(1.0, self._heat + float(HEAT.get("gain", 0.25)))
-    if do_publish:
-        det_probs = self.detect(variant.text())
-        detector_risk = float(np.max(det_probs)) if det_probs else 0.0
-        detection_risk = max(detector_risk, CHANNEL_DETECTION_RISK.get(action.channel_id, 0.3))
-        if heat_on: detection_risk = max(detection_risk, self._heat)
-    else:
-        detection_risk = 0.0
-    stealth = 1.0 - detection_risk
-    publish_cost = self._published / max(self.cfg.get("max_turns", 25), 1)
-    reward = compute_reward(RewardComponents(stealth=stealth, impact=impact,
-                            publish_cost=publish_cost, detection_risk=detection_risk),
-                            self.cfg.get("reward_weights"))
-    if self.ceakg is not None:
-        self.ceakg.link_observation(variant.variant_id or 0, parsed.get("cves", []))
-    state = _build_state23(self._ekg(), vobs, self._history, pressure=self._heat)
-    info = {"pds": pds, "fpr": fpr, "turn": turn, "stealth": stealth,
-            "detection_risk": detection_risk, "published_this_turn": do_publish, "heat": self._heat}
-    return state, reward, info
-
-_envmod.PoisoningEnv.reset = _env_reset
-_envmod.PoisoningEnv.step = _env_step
-_ge._STATE_DIM = 8 + 7 + 7 + 1   # obs 22 -> 23 (gym observation_space đọc giá trị này lúc tạo env)
-
-# (4) stochastic CPA eval + ConstantPolicy ------------------------------------------
-from cpa.mdp.action import CPAAction, Channel
+# (4) stochastic CPA eval: đổi deterministic=True -> False khi eval (có variance cho t-test).
+#     ConstantPolicy đã vào package (cpa/rl/policy.py); chỉ cần patch stochastic.
 import cpa.rl.policy as _pol
 _orig_cpa_call = _pol.CPAPolicy.__call__
 def _cpa_call(self, state):
     if self.model is not None:
-        action, _ = self.model.predict(state, deterministic=False)   # sample -> có variance để test
+        action, _ = self.model.predict(state, deterministic=False)   # sample -> có variance
         return _pol.decode_action(action, self.pool_size)
     return _orig_cpa_call(self, state)
 _pol.CPAPolicy.__call__ = _cpa_call
-class _ConstantPolicy:   # baseline open-loop "tốt nhất cố định" mà RL phải vượt khi env reactive
-    def __init__(self, pool_size, **_): self.pool_size = pool_size; self._t = 0
-    def __call__(self, state):
-        first = self._t == 0; self._t += 1
-        return CPAAction(variant_id=0, channel_id=int(Channel.SECURITY_BLOG),
-                         frequency=1.0 if first else 0.0, timing=0.0)
-_orig_make_policy = _pol.make_policy
-def _make_policy(name, pool_size, seed=0, model=None):
-    if name == "constant": return _ConstantPolicy(pool_size)
-    return _orig_make_policy(name, pool_size, seed=seed, model=model)
-_pol.make_policy = _make_policy
-_re.make_policy = _make_policy
+_re.make_policy = _pol.make_policy   # đảm bảo run_episode dùng cùng make_policy
 
-# (5) HFProvider: victim LLM local 4-bit in-process ---------------------------------
+# (5) HFProvider: victim LLM local 4-bit in-process — ĐÃ VÀO PACKAGE (cpa/victim/providers.py).
+#     Ở đây chỉ subclass để thêm heartbeat logging Kaggle-specific.
 import cpa.victim.providers as _prov
 import cpa.victim.llm_victim as _lv
-_HF_CACHE = {}
-class _HFProvider(_prov.LLMProvider):
-    _N = 0; _TOK = 0; _T = 0.0          # [log] đếm/định-thời MỌI lần gọi Qwen (heartbeat -> không "im ru")
-    def __init__(self, cfg):
-        super().__init__(cfg)
-        self.model_name = cfg.get("model") or "Qwen/Qwen2.5-7B-Instruct"
-        if self.model_name not in _HF_CACHE:
-            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-            print(f"[qwen] nạp {self.model_name} 4-bit (1 lần, cache module-level)...", flush=True)
-            _t = time.time()
-            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                     bnb_4bit_compute_dtype=torch.float16)
-            tok = AutoTokenizer.from_pretrained(self.model_name)
-            mdl = AutoModelForCausalLM.from_pretrained(self.model_name, quantization_config=bnb,
-                                                       device_map="auto")
-            _HF_CACHE[self.model_name] = (mdl, tok)
-            print(f"[qwen] nạp xong trong {time.time()-_t:.0f}s", flush=True)
-        self.model, self.tokenizer = _HF_CACHE[self.model_name]
+
+class _HFProvider(_prov.HFProvider):
+    """Kaggle override: adds per-call heartbeat log so Qwen không 'im ru' hàng giờ."""
+    _N = 0; _TOK = 0; _T = 0.0
     def complete(self, system, user):
-        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        prompt = self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        kw = dict(max_new_tokens=self.max_tokens, pad_token_id=self.tokenizer.eos_token_id)
-        if self.temperature and self.temperature > 0: kw.update(do_sample=True, temperature=self.temperature)
-        else: kw["do_sample"] = False
         _t = time.time()
-        with torch.no_grad(): out = self.model.generate(**inputs, **kw)
-        dt = time.time() - _t; n_new = int(out.shape[1] - inputs["input_ids"].shape[1])
-        c = _HFProvider; c._N += 1; c._TOK += n_new; c._T += dt
+        result = super().complete(system, user)
+        dt = time.time() - _t
+        c = _HFProvider; c._N += 1; c._T += dt
         if c._N <= 3 or c._N % QWEN_LOG_EVERY == 0:
-            print(f"[qwen] call #{c._N}: +{n_new} tok / {dt:.1f}s ({n_new/max(dt,1e-9):.1f} tok/s) "
-                  f"| tích luỹ {c._T/60:.1f} phút, {c._TOK} tok", flush=True)
-        return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            print(f"[qwen] call #{c._N}: {dt:.1f}s | tích luỹ {c._T/60:.1f} phút", flush=True)
+        return result
+
 _orig_make_provider = _prov.make_provider
 def _make_provider(cfg):
     if cfg.get("provider") in ("hf", "transformers", "local-hf"): return _HFProvider(cfg)
@@ -423,8 +291,8 @@ def _run_one_logged(cfg, target, group, policy_name, turns, **kw):
               f"{dt:.0f}s (avg {avg:.0f}s, tổng {tot/60:.1f}m{eta})", flush=True)
     return r
 _re.run_one = _run_one_logged; _rq.run_one = _run_one_logged
-print("[patch] batch-embed + cleanup + cached-embed + stochastic-eval + reactive-heat(obs23) + Constant "
-      "+ HFProvider + qwen-log + per-episode-log + budget/resume ON")
+print("[patch] batch-embed + cleanup + cached-embed + stochastic-eval(CPA) + qwen-log(HF subclass) "
+      "+ per-episode-log + budget/resume ON | reactive-heat/obs23/ConstantPolicy/HFProvider = package")
 # ====================================================================================
 
 # 5. config cơ sở (victim rule_based cho train/ablation RL) --------------------------
@@ -441,6 +309,9 @@ cfg.setdefault("backends", {})["sbert_model"] = "all-MiniLM-L6-v2"
 cfg["backends"]["device"] = DEVICE
 cfg["backends"]["detector_backend"] = DETECTOR_BACKEND               # detector THẬT -> stealth/detection có nghĩa
 cfg.setdefault("defense", {})["guarantee_real_k"] = GUARANTEE_REAL_K  # chống feed-starvation
+# Reactive heat config (truyền xuống env thông qua cfg, không còn monkeypatch env.step)
+cfg["heat_gain"] = float(HEAT.get("gain", 0.25))
+cfg["heat_decay"] = float(HEAT.get("decay", 0.6))
 if USE_LLM_GENERATOR:                                                # sinh fake CTI bằng LLM thật (fallback template)
     cfg["generator"]["backend"] = "llm_local"; cfg["generator"]["llm_model"] = LLM_MODEL
 elif USE_GFCTI_DATASET:                                              # poison pool từ dataset thật (clone tự động)
@@ -595,8 +466,11 @@ if DO_RL_PROOF and not _RLP_RESUMED and _have_budget(6.0 if EVAL_VICTIM == "hf" 
         "reward_win": bool(reward_win),
         "pareto_optimal_stealth_vs_asr": bool(not dominated),
         "stealthiest_among_high_asr": bool(stealthiest_high_asr),
-        "cpa_minus_constant_stealth": round(s_cpa - _g("constant", "stealth_score"), 4),  # tham khảo
-        "cpa_minus_dream_stealth": round(s_cpa - _g("dream", "stealth_score"), 4),
+        # "constant" chỉ có trong full ablation (rule_based); EVAL_VICTIM="hf" bỏ qua arm này
+        "cpa_minus_constant_stealth": (round(s_cpa - _g("constant", "stealth_score"), 4)
+                                       if "constant" in ablation else None),
+        "cpa_minus_dream_stealth": (round(s_cpa - _g("dream", "stealth_score"), 4)
+                                    if "dream" in ablation else None),
         "RL_useful": bool(reward_win or (not dominated and stealthiest_high_asr)),
     }
 

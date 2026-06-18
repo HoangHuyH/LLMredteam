@@ -101,6 +101,53 @@ class OpenAICompatibleProvider(LLMProvider):
         return self._retry(_call)
 
 
+class HFProvider(LLMProvider):
+    """In-process HuggingFace transformers provider (4-bit quantized via bitsandbytes).
+
+    Loads the model once per process (class-level cache) so multiple episodes sharing
+    the same model name don't reload weights. Requires: transformers + bitsandbytes.
+    """
+
+    _model_cache: dict = {}
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__(cfg)
+        self.model_name = cfg.get("model") or "Qwen/Qwen2.5-7B-Instruct"
+        if self.model_name not in self.__class__._model_cache:
+            try:
+                import torch
+                from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            except ImportError as e:
+                raise RuntimeError(
+                    f"HFProvider requires transformers + bitsandbytes: pip install transformers bitsandbytes ({e})"
+                ) from e
+            import torch as _torch
+            bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                     bnb_4bit_compute_dtype=_torch.float16)
+            tok = AutoTokenizer.from_pretrained(self.model_name)
+            mdl = AutoModelForCausalLM.from_pretrained(
+                self.model_name, quantization_config=bnb, device_map="auto"
+            )
+            self.__class__._model_cache[self.model_name] = (mdl, tok)
+        self._model, self._tokenizer = self.__class__._model_cache[self.model_name]
+
+    def complete(self, system: str, user: str) -> str:
+        import torch
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        prompt = self._tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+        kw = dict(max_new_tokens=self.max_tokens, pad_token_id=self._tokenizer.eos_token_id)
+        if self.temperature and self.temperature > 0:
+            kw.update(do_sample=True, temperature=self.temperature)
+        else:
+            kw["do_sample"] = False
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **kw)
+        return self._tokenizer.decode(
+            out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+
+
 def make_provider(cfg: dict) -> LLMProvider:
     """Factory: cfg.provider -> provider instance."""
     provider = cfg.get("provider", "anthropic")
@@ -108,4 +155,6 @@ def make_provider(cfg: dict) -> LLMProvider:
         return AnthropicProvider(cfg)
     if provider in ("openai", "openrouter", "local"):
         return OpenAICompatibleProvider(cfg)
+    if provider in ("hf", "transformers", "local-hf"):
+        return HFProvider(cfg)
     raise ValueError(f"Unknown victim provider: {provider!r}")

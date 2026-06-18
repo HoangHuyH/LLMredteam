@@ -86,6 +86,30 @@ class NoPoisonPolicy:
         return CPAAction(variant_id=0, channel_id=0, frequency=0.0, timing=0.0)
 
 
+class ConstantPolicy:
+    """Open-loop 'best fixed' baseline: publish once on a low-risk channel, then stop.
+
+    RQ2 baseline: if the RL policy cannot beat this, it has not learned anything useful.
+    publish_once=True means the first call fires frequency=1.0; all subsequent calls are
+    frequency=0.0 (still-stealthy throttle). The victim stays derailed because it reads the
+    same poisoned store every turn after publication.
+    """
+
+    def __init__(self, pool_size: int, **_) -> None:
+        self.pool_size = pool_size
+        self._t = 0
+
+    def __call__(self, state: np.ndarray) -> CPAAction:
+        first = self._t == 0
+        self._t += 1
+        return CPAAction(
+            variant_id=0,
+            channel_id=int(Channel.SECURITY_BLOG),  # lowest-risk channel
+            frequency=1.0 if first else 0.0,
+            timing=0.0,
+        )
+
+
 def decode_action(action, pool_size: int) -> CPAAction:
     """Decode a flat SB3 MultiDiscrete/Box action into a CPAAction."""
     a = np.atleast_1d(action)
@@ -106,6 +130,10 @@ def make_policy(name: str, pool_size: int, seed: int = 0, model=None):
         return CPAPolicy(pool_size, model=model)
     if name in ("none", "nopoison"):
         return NoPoisonPolicy(pool_size)
+    if name == "constant":
+        return ConstantPolicy(pool_size)
+    if name == "heuristic":
+        return CPAPolicy(pool_size, model=None)  # burst-then-throttle heuristic, no PPO model
     if name in ("mcts", "mcts_only"):
         # DREAM planning baseline (C-GPS+MCTS). Imported lazily so the lightweight policies above
         # never pull the MCTS module unless asked for.
