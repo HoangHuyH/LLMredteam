@@ -23,7 +23,7 @@ import yaml
 from cpa.generator import FakeCTIGenerator
 from experiments.backends import make_detector_fn
 
-OUT = Path(__file__).parent / "detector_benchmark.json"
+OUT = Path("experiments/detector_benchmark.json")
 
 
 def load_cfg(path: str) -> dict:
