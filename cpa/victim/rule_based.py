@@ -65,12 +65,20 @@ class RuleBasedVictim(VictimAgent):
             return tda.EVIDENCE_LEVELS["SPECULATIVE"], []
         evidence, poison_vulns = 0.0, []
         for r in poison:
+            rel = getattr(getattr(r, "target_relevance", None), "value", "low")
+            tag_conf = RELEVANCE_EVIDENCE.get(rel, 0.35)  # calibrated base credibility (RQ1 lever)
             score = getattr(r, "retrieval_score", None)
             if score is not None:
-                conf = float(score)                       # emergent: real cosine similarity
+                # Real MiniLM cosine on short profile queries runs low in absolute terms
+                # (~0.2-0.5), so using it raw would push even a genuinely high-relevance poison
+                # below COMMIT_EVIDENCE and the victim would NEVER commit (the "inert to poison"
+                # bug seen in gym/RQ2). Anchor on the relevance tag and let the measured cosine
+                # only ADD emergent within-group variation: high-relevance (Group B) poison still
+                # commits, generic (Group A) still does not, and the A/B contrast stays driven by
+                # real semantics rather than a low absolute threshold.
+                conf = max(tag_conf, float(score))
             else:
-                rel = getattr(getattr(r, "target_relevance", None), "value", "low")
-                conf = RELEVANCE_EVIDENCE.get(rel, 0.35)  # fallback: relevance tag
+                conf = tag_conf                           # fallback: relevance tag only
             evidence = max(evidence, conf)
             for cve in getattr(getattr(r, "entities", None), "cves", []) or []:
                 if self._rng.random() <= self._report_p:

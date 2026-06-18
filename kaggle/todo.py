@@ -1,5 +1,9 @@
 # =====================================================================================
 # CPA — Kaggle runner GỌN, bám sát capstone §3 (RQ1/RQ2/RQ3 + defense). 1 cell.
+# So với todo.py: BỎ LangGraph-demo, detector-benchmark, obs-perturbation, arm
+# dream/heuristic/constant, knob generator thừa. SỬA: arms = đúng 5 baseline capstone
+# (cpa, mcts=DREAM C-GPS+MCTS, mcts_only, random, nopoison), checkpoint TỪNG arm
+# (crash không mất cả phase), báo cáo net-ASR-so-với-control (phơi bày nhiễu LLM).
 # SETUP: Accelerator = GPU T4 x2, Internet = ON. Patch reactive-heat/obs23/HFProvider GIỮ.
 # =====================================================================================
 import os, sys, subprocess, json, time, copy, shutil
@@ -15,26 +19,25 @@ DO_RQ3      = False     # ANOVA A/B × policy (rule_based; bật khi cần đo l
 EVAL_VICTIM = "hf"      # victim cho RQ2 ablation: "rule_based"(nhanh, TRƠ-poison) | "hf"(Qwen thật, chậm)
                         # Train PPO + defense + RQ3 LUÔN rule_based (cần hàng vạn step). Chỉ EVAL dùng Qwen.
 
-# Đúng 5 baseline capstone §3.2:
+# Đúng 5 baseline capstone §3.2 (KHÔNG còn dream-greedy/heuristic/constant):
 #   cpa = phương pháp (RL/PPO) | mcts = DREAM C-GPS+MCTS | mcts_only = DREAM+MCTS only
 #   random = Random Poisoning  | nopoison = No Poisoning (CONTROL — mốc chuẩn hoá/noise floor)
 ABLATION_ARMS = ["cpa", "mcts", "mcts_only", "random", "nopoison"]
-# hf rất chậm: muốn tiết kiệm -> rút còn ["cpa","mcts","random","nopoison"] (bỏ mcts_only).
+# hf rất chậm: muốn tiết kiệm thì rút còn ["cpa","mcts","random","nopoison"] (bỏ mcts_only).
 
 # ---- nguồn dữ liệu / detector ----
 DETECTOR_BACKEND = "ensemble"  # GLTR+RoBERTa thật -> stealth/UR/DS có nghĩa (cần transformers)
 USE_GFCTI_DATASET = True       # poison pool = GFCTI-Finance (Qwen sinh fake; fallback template nếu lỗi)
 GFCTI_LIMIT = 400              # số seed finance đưa qua Qwen (0 = cả 1239)
-GUARANTEE_REAL_K = 2           # giữ >=K CTI thật trong feed khi bật defense
+GUARANTEE_REAL_K = 2           # giữ >=K CTI thật trong feed khi bật defense (chống feed-starvation)
 USE_CURRICULUM = True          # PPO 3 mức: random(A) -> context_aware(B) -> multi_turn
 
 # ---- quy mô ----
-SCALE = "qwen1s"   # qwen1s=4/5/12 | smoke=3/8/12 | medium=8/15/20 | full=8/15/25
+SCALE = "qwen1s"   # qwen1s=4/5/12 (Qwen gọn 1 session) | smoke=3/8/12 | medium=8/15/20 | full=8/15/25
 _SCALES = {"qwen1s": (8_000, 4, 5, 12), "smoke": (8_000, 3, 8, 12),
            "medium": (40_000, 8, 15, 20), "full": (60_000, 8, 15, 25)}
 PPO_STEPS, MAX_TARGETS, EPISODES, TURNS = _SCALES[SCALE]
-RQ1_TARGETS = (8 if SCALE in ("medium", "full") else 4)
-RQ1_EPISODES, RQ1_TURNS = 5, 12
+RQ1_TARGETS, RQ1_EPISODES, RQ1_TURNS = (8 if SCALE in ("medium", "full") else 4), 5, 12  # capstone muốn đủ 8 target
 LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 HEAT = {"gain": 0.25, "decay": 0.6, "enabled": True}
 
@@ -53,7 +56,7 @@ elif SESSION == 2: DO_LLM_RQ1 = True
 if os.path.isdir(S1_DATASET):
     if S1_DATASET not in RESUME_DIRS: RESUME_DIRS.append(S1_DATASET)
 elif SESSION == 2:
-    print(f"[warn] S1_DATASET='{S1_DATASET}' KHÔNG tồn tại — rule_based sẽ chạy lại.", flush=True)
+    print(f"[warn] S1_DATASET='{S1_DATASET}' KHÔNG tồn tại — rule_based sẽ chạy lại từ đầu.", flush=True)
 print(f"[session] SESSION={SESSION} | DO_LLM_RQ1={DO_LLM_RQ1} | RESUME_DIRS={RESUME_DIRS}", flush=True)
 
 def sh(*a, **k):
@@ -66,7 +69,8 @@ def _elapsed_h(): return (time.time() - _T_START) / 3600.0
 def _have_budget(est_h, name):
     if not WALL_BUDGET_H: return True
     if _elapsed_h() + est_h > WALL_BUDGET_H:
-        print(f"[budget] BỎ QUA {name}: {_elapsed_h():.2f}h + ~{est_h:.1f}h > {WALL_BUDGET_H}h", flush=True)
+        print(f"[budget] BỎ QUA {name}: {_elapsed_h():.2f}h + ~{est_h:.1f}h > {WALL_BUDGET_H}h "
+              f"-> lưu partial, session sau RESUME làm nốt.", flush=True)
         return False
     return True
 def _find_ckpt(fname):
@@ -84,7 +88,7 @@ def _resume_json(fname, key):
     except Exception as e:
         print(f"[resume] {key}: đọc {p} lỗi ({e})", flush=True); return False
 
-# 1. clone branch
+# 1. clone branch -------------------------------------------------------------------
 if not os.path.isdir(REPO_DIR):
     sh("git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, REPO_DIR)
 else:
@@ -92,7 +96,7 @@ else:
     sh("git", "-C", REPO_DIR, "reset", "--hard", f"origin/{BRANCH}")
 os.chdir(REPO_DIR); sys.path.insert(0, REPO_DIR)
 
-# 2. deps (KHÔNG cài langgraph)
+# 2. deps (KHÔNG cài langgraph — đã bỏ demo) ----------------------------------------
 sh(sys.executable, "-m", "pip", "install", "-q", "--no-deps", "stable-baselines3", "sentence-transformers")
 sh(sys.executable, "-m", "pip", "install", "-q", "chromadb", "gymnasium", "scipy", "networkx", "pyyaml")
 _NEED_HF = DO_LLM_RQ1 or EVAL_VICTIM == "hf" or USE_GFCTI_DATASET or DETECTOR_BACKEND != "heuristic"
@@ -103,7 +107,7 @@ if _NEED_HF:
 if DO_LLM_RQ1 or EVAL_VICTIM == "hf" or USE_GFCTI_DATASET:
     sh(sys.executable, "-m", "pip", "install", "-q", "bitsandbytes")
 
-# 3. corpus thật (CASIE + CyEnts)
+# 3. corpus thật (CASIE + CyEnts) ---------------------------------------------------
 if not os.path.exists("data/real_cti_corpus.jsonl"):
     for name, url in {"CASIE": "https://github.com/Ebiquity/CASIE",
                       "CyEnts": "https://github.com/UMBC-Onramp/CyEnts-Cyber-Blog-Dataset"}.items():
@@ -123,7 +127,8 @@ from sentence_transformers import SentenceTransformer
 _m = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE); _m.encode(["smoke"]); del _m
 
 # ====================================================================================
-# 4. MONKEYPATCHES (giữ các patch CẦN; bỏ ConstantPolicy + obs-perturbation)
+# 4. MONKEYPATCHES (giữ nguyên các patch CẦN; bỏ ConstantPolicy + obs-perturbation)
+#    TODO: nên chuyển (1)(2)(3)(5) vào package cpa/ để repo == runtime.
 # ====================================================================================
 import numpy as np, yaml
 from experiments.run_episode import load_cfg
@@ -211,7 +216,7 @@ def _env_step(self, action):
         try: r.retrieval_score = s
         except Exception: pass
         cti_context.append(r)
-    if self.verifier is not None:
+    if self.verifier is not None:   # chống feed-starvation (chỉ path defense)
         guarantee = self.cfg.get("guarantee_real_k", 2)
         real_in = sum(1 for r in cti_context if not r.is_poison)
         if real_in < guarantee:
@@ -240,7 +245,8 @@ def _env_step(self, action):
             if not blocked: kept.append(r)
         cti_context = kept
     turn = self.victim.step(cti_context)
-    parsed = parse_turn(turn, self.gt); vobs = observation_vector(parsed); self._history.append(vobs)
+    parsed = parse_turn(turn, self.gt)
+    vobs = observation_vector(parsed); self._history.append(vobs)
     pds = planning_deviation_score(self._baseline_emb, self.embed(turn.plan_text))
     reported = list(turn.reported_vulns) + [{"cve": c} for c in parsed.get("cves", [])]
     fpr = false_positive_rate(reported, self.gt)
@@ -270,7 +276,7 @@ _envmod.PoisoningEnv.reset = _env_reset
 _envmod.PoisoningEnv.step = _env_step
 _ge._STATE_DIM = 8 + 7 + 7 + 1
 
-# (4) stochastic CPA eval (bỏ ConstantPolicy — không còn arm constant)
+# (4) stochastic CPA eval (BỎ ConstantPolicy — không còn arm constant)
 import cpa.rl.policy as _pol
 _orig_cpa_call = _pol.CPAPolicy.__call__
 def _cpa_call(self, state):
@@ -341,7 +347,7 @@ _re.run_one = _run_one_logged; _rq.run_one = _run_one_logged
 print("[patch] batch-embed + cached-embed + reactive-heat(obs23) + stochastic-cpa + HFProvider + qwen-log ON")
 
 # ====================================================================================
-# 5. config
+# 5. config (train PPO + defense + RQ3 = rule_based; EVAL victim theo EVAL_VICTIM)
 # ====================================================================================
 cfg = load_cfg("config/default.yaml")
 cfg["victim"]["provider"] = "rule_based"
@@ -350,7 +356,7 @@ cfg.setdefault("backends", {})["sbert_model"] = "all-MiniLM-L6-v2"
 cfg["backends"]["device"] = DEVICE
 cfg["backends"]["detector_backend"] = DETECTOR_BACKEND
 cfg.setdefault("defense", {})["guarantee_real_k"] = GUARANTEE_REAL_K
-if USE_GFCTI_DATASET:
+if USE_GFCTI_DATASET:   # 1 nguồn duy nhất: GFCTI-Finance (Qwen sinh fake); fallback template trong generator
     _gf = "data/gfcti_finance.jsonl"
     _gf_cache = _find_ckpt("gfcti_finance.jsonl")
     if RESUME and _gf_cache and not os.path.exists(_gf):
@@ -369,7 +375,7 @@ if USE_GFCTI_DATASET:
 GPU_CFG = "/kaggle/working/default_gpu.yaml"
 with open(GPU_CFG, "w") as f: yaml.safe_dump(cfg, f, sort_keys=False)
 
-cfg_eval = copy.deepcopy(cfg)
+cfg_eval = copy.deepcopy(cfg)   # victim cho RQ2 ablation (có thể = Qwen)
 if EVAL_VICTIM == "hf":
     cfg_eval["victim"].update(provider="hf", model=LLM_MODEL, temperature=0.7, max_tokens=512)
 print(f"[cfg] eval victim = {cfg_eval['victim']['provider']} | scale={SCALE} "
@@ -381,12 +387,13 @@ _nt = MAX_TARGETS if MAX_TARGETS > 0 else len(cfg_eval["victim"]["targets"])
 _SUF = "_hf" if EVAL_VICTIM == "hf" else ""
 
 # ====================================================================================
-# 6A. RQ2 — train PPO + ablation 5 arm + verdict-VS-CONTROL
+# 6A. RQ2 — train PPO (reactive) + ablation 5 arm + verdict-VS-CONTROL
 # ====================================================================================
 if DO_RL_PROOF and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq2"):
     from stable_baselines3 import PPO
     from experiments.run_episode import run_one
 
+    # --- train (hoặc resume) PPO ---
     _ppo_out = "/kaggle/working/cpa_ppo"; _ppo_ckpt = _find_ckpt("cpa_ppo.zip")
     if RESUME and _ppo_ckpt:
         cpa_model = PPO.load(_ppo_ckpt[:-4]); print(f"[resume] PPO <- {_ppo_ckpt}", flush=True)
@@ -405,7 +412,7 @@ if DO_RL_PROOF and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq2"):
         return {"mean": round(float(np.mean(xs)), 4),
                 "std": round(float(np.std(xs, ddof=1)) if len(xs) > 1 else 0.0, 4)}
 
-    # Checkpoint TỪNG arm: crash/12h không mất cả phase
+    # --- ablation: ĐÚNG 5 baseline capstone, CHECKPOINT TỪNG ARM (crash không mất cả phase) ---
     _abl_ckpt = os.path.join(CKPT_DIR, f"ablation{_SUF}.json")
     ablation = {}
     if RESUME and os.path.exists(_abl_ckpt):
@@ -415,18 +422,18 @@ if DO_RL_PROOF and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq2"):
                "random": ("random", None), "nopoison": ("none", None)}
     arms = [(a, *arm_pol[a]) for a in ABLATION_ARMS if a in arm_pol]
     targets = cfg_eval["victim"]["targets"][:MAX_TARGETS]
-    print(f"\n=== RQ2 Ablation ({cfg_eval['victim']['provider']}) ===")
+    print(f"\n=== RQ2 Ablation (group B, reactive, victim={cfg_eval['victim']['provider']}) ===")
     _phase("ablation", len(arms) * len(targets) * EPISODES)
     for label, pname, model in arms:
         if label in ablation:
             print(f"[skip] arm {label} đã xong", flush=True); continue
-        if not _have_budget(0.1, f"arm {label}"): break
+        if not _have_budget(0.1, f"arm {label}"): break   # hết budget -> dừng, giữ arm đã xong
         rows = [run_one(cfg_eval, tgt, "B", pname, TURNS, seed=s, cpa_model=model)
                 for tgt in targets for s in range(EPISODES)]
-        ablation[label] = {m: _summ(m, rows) for m in ("stealth_score", "max_pds", "max_fpr", "cfr",
-                                                         "mean_reward", "published",
+        ablation[label] = {m: _summ(m, rows) for m in ("stealth_score", "max_pds", "max_fpr", "cfr", "mean_reward", "published",
                                                          "undetected_rate", "detection_score")}
         ablation[label]["ASR_%"] = round(100 * np.mean([r["success"] for r in rows]), 1)
+        # ATMI: Optional[int] — None-safe (không dùng _summ vì float(None) crash)
         _atmi_hits = [r["atmi"] for r in rows if r.get("atmi") is not None]
         ablation[label]["atmi"] = {
             "mean_turns": round(float(np.mean(_atmi_hits)), 4) if _atmi_hits else None,
@@ -443,7 +450,8 @@ if DO_RL_PROOF and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq2"):
               f"  UR={a['undetected_rate']['mean']:.3f}  DS={a['detection_score']['mean']:.3f}"
               f"  ATMI={_atmi_str}", flush=True)
 
-    # Verdict so với CONTROL (nopoison)
+    # --- verdict TRUNG THỰC: mọi arm tấn công so với CONTROL (nopoison) ---
+    # nopoison đã "thành công" cao = nhiễu nền (victim LLM stochastic). Net = arm - control mới có nghĩa.
     def _g(k, m): return ablation[k]["ASR_%"] if m == "ASR_%" else ablation[k][m]["mean"]
     ctrl_asr = _g("nopoison", "ASR_%") if "nopoison" in ablation else 0.0
     ctrl_pds = _g("nopoison", "max_pds") if "nopoison" in ablation else 0.0
@@ -455,35 +463,45 @@ if DO_RL_PROOF and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq2"):
     verdict = {
         "control_asr": ctrl_asr, "control_max_pds": round(ctrl_pds, 4),
         "per_arm_vs_control": per_arm,
+        # RQ2 lõi: cpa (RL) vs mcts (DREAM C-GPS+MCTS baseline)
         "cpa_beats_control": per_arm.get("cpa", {}).get("beats_control"),
         "cpa_vs_mcts_stealth": round(_g("cpa", "stealth_score") - _g("mcts", "stealth_score"), 4) if {"cpa", "mcts"} <= set(ablation) else None,
         "cpa_vs_mcts_asr": round(_g("cpa", "ASR_%") - _g("mcts", "ASR_%"), 1) if {"cpa", "mcts"} <= set(ablation) else None,
         "cpa_reward_win": bool(_g("cpa", "mean_reward") >= max((_g(k, "mean_reward") for k in attack if k != "cpa"), default=0.0) - 1e-6) if "cpa" in ablation else None,
-        "WARNING": "Nếu không arm nào beats_control=True -> tấn công KHÔNG vượt nhiễu nền. Báo cáo đúng như vậy.",
+        "WARNING": ("Nếu không arm nào beats_control=True -> tấn công KHÔNG vượt nhiễu nền trên victim này. "
+                    "Báo cáo đúng như vậy."),
     }
     report["rq2"] = {"ablation": ablation, "verdict_vs_control": verdict}
     print("\n[RQ2] verdict_vs_control:", json.dumps(verdict, indent=2, ensure_ascii=False), flush=True)
     with open(f"/kaggle/working/rq2{_SUF}.json", "w") as f: json.dump(report["rq2"], f, indent=2)
 
-# 6B. DEFENSE
+# ====================================================================================
+# 6B. DEFENSE — verifier OFF/ON (rule_based)
+# ====================================================================================
 if DO_DEFENSE and not _resume_json("defense.json", "defense") and _have_budget(2.0, "defense"):
     from experiments.run_rq import run_defense_ablation
-    print("\n=== Defense ablation ==="); _phase("defense", _nt * EPISODES * 2); t0 = time.time()
+    print("\n=== Defense ablation (verifier OFF/ON) ===")
+    _phase("defense", _nt * EPISODES * 2); t0 = time.time()
     report["defense"] = run_defense_ablation(cfg, EPISODES, TURNS, MAX_TARGETS)
     print(f"defense {time.time()-t0:.0f}s"); print(json.dumps(report["defense"], indent=2)[:1500])
     with open("/kaggle/working/defense.json", "w") as f: json.dump(report["defense"], f, indent=2)
 
-# 6C. RQ3
+# ====================================================================================
+# 6C. RQ3 — two-way ANOVA A/B × policy (rule_based)
+# ====================================================================================
 if DO_RQ3 and not _resume_json(f"rq3{_SUF}.json", "rq3") and _have_budget(6.0 if EVAL_VICTIM == "hf" else 3.0, "rq3"):
     from experiments.run_rq import run_rq3
-    print("\n=== RQ3 (ANOVA) ==="); _phase("rq3", _nt * EPISODES * 2 * 2); t0 = time.time()
+    print("\n=== RQ3 (ANOVA: CTI-context A/B × policy) ===")
+    _phase("rq3", _nt * EPISODES * 2 * 2); t0 = time.time()
     report["rq3"] = run_rq3(cfg_eval, EPISODES, TURNS, MAX_TARGETS, cpa_model=(cpa_model if DO_RL_PROOF else None))
     print(f"RQ3 {time.time()-t0:.0f}s"); print(json.dumps(report["rq3"], indent=2)[:1200])
     with open(f"/kaggle/working/rq3{_SUF}.json", "w") as f: json.dump(report["rq3"], f, indent=2)
 
-# 6D. RQ1 — Qwen victim (CHẬM, đặt cuối)
+# ====================================================================================
+# 6D. RQ1 — A vs B trên victim Qwen thật (CHẬM, đặt cuối; resume nếu hết 12h)
+# ====================================================================================
 if DO_LLM_RQ1 and not _resume_json("rq1_llm.json", "rq1_llm") and _have_budget(5.0, "rq1_llm"):
-    print(f"\n=== RQ1 victim LLM ({LLM_MODEL}) A vs B ===")
+    print(f"\n=== RQ1 victim LLM ({LLM_MODEL}) A vs B — CHẬM ===")
     cfg_llm = copy.deepcopy(cfg)
     cfg_llm["victim"].update(provider="hf", model=LLM_MODEL, temperature=0.7, max_tokens=512)
     _phase("rq1-llm", RQ1_TARGETS * RQ1_EPISODES * 2); t0 = time.time()
@@ -493,4 +511,4 @@ if DO_LLM_RQ1 and not _resume_json("rq1_llm.json", "rq1_llm") and _have_budget(5
 
 with open("/kaggle/working/results.json", "w") as f: json.dump(report, f, indent=2)
 print(f"\n[done] elapsed {_elapsed_h():.2f}h | phases: {sorted(report)}", flush=True)
-print("Thiếu phase nào: Save Version -> mount output làm Dataset -> RESUME_DIRS -> Run lại.")
+print("Thiếu phase nào (hết budget): Save Version -> mount output làm Dataset -> RESUME_DIRS -> Run lại.")

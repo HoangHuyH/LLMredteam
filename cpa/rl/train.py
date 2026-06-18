@@ -15,6 +15,7 @@ random/context_aware/multi_turn, LoRA on Llama-3-8B) layers on top of this PPO c
 from __future__ import annotations
 
 import argparse
+import os
 
 import yaml
 
@@ -47,7 +48,8 @@ def train_ppo(config_path: str, timesteps: int, out: str, group: str = "B", turn
 
 
 def train_ppo_curriculum(config_path: str, total_timesteps: int, out: str, stages=None,
-                         turns: int = 15, device: str = "auto", multi_turn_turns: int = None):
+                         turns: int = 15, device: str = "auto", multi_turn_turns: int = None,
+                         init_from: str = None):
     """3-level curriculum (Section 2.7) with policy transfer across stages.
 
         Stage 1 "random"        -> Group A (generic / low-relevance poison)
@@ -93,7 +95,13 @@ def train_ppo_curriculum(config_path: str, total_timesteps: int, out: str, stage
         print(f"[curriculum] stage {i+1}/{len(plan)} '{name}': group={group} turns={stage_turns} timesteps={ts}")
         if model is None:
             # Build the model ONCE on stage 1; n_steps/batch_size are fixed here for all stages.
-            model = PPO("MlpPolicy", env, **_ppo_kwargs(cfg, stage_turns, device))
+            # If a behavior-cloned init (Phase 1, cpa.rl.pretrain) exists, warm-start from it so
+            # the offline DREAM imitation is carried into online curriculum instead of overwritten.
+            if init_from and os.path.exists(init_from + ".zip"):
+                model = PPO.load(init_from, env=env, device=device)
+                print(f"[curriculum] warm-start from BC init {init_from}.zip")
+            else:
+                model = PPO("MlpPolicy", env, **_ppo_kwargs(cfg, stage_turns, device))
             model.learn(total_timesteps=ts)
         else:
             # Carry the learned policy forward — set_env keeps weights; rollout length (n_steps)
@@ -117,10 +125,12 @@ def main() -> None:
                     help="3-stage curriculum (random/A -> context_aware/B -> multi_turn/B) with policy transfer")
     ap.add_argument("--multi-turn-turns", dest="multi_turn_turns", type=int, default=None,
                     help="turns for the final multi_turn stage (default round(turns*1.7))")
+    ap.add_argument("--init-from", dest="init_from", default=None,
+                    help="path to behavior-cloned PPO init (from cpa.rl.pretrain) to warm-start curriculum")
     args = ap.parse_args()
     if args.curriculum:
         train_ppo_curriculum(args.config, args.timesteps, args.out, turns=args.turns,
-                             multi_turn_turns=args.multi_turn_turns)
+                             multi_turn_turns=args.multi_turn_turns, init_from=args.init_from)
     else:
         train_ppo(args.config, args.timesteps, args.out, args.group, args.turns)
 

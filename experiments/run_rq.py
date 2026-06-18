@@ -27,6 +27,11 @@ try:
 except Exception:
     _stats = None
 
+try:
+    from cpa.metrics.efficiency import avg_turns_to_major_impact as _avg_atmi
+except Exception:
+    _avg_atmi = None
+
 
 def _summ(xs: List[float]) -> dict:
     xs = [float(x) for x in xs]
@@ -101,99 +106,65 @@ def _two_way_anova(rows: List[dict], fa: str, fb: str, dv: str) -> dict:
     }
 
 
+def _atmi_panel(rows: List[dict]) -> dict:
+    """None-safe ATMI aggregation.
+
+    atmi is Optional[int] — None when no major-impact turn was reached.
+    Reports mean over episodes that DID reach a major-impact turn (hits only),
+    the hit rate (fraction of episodes with a hit), and raw count.
+    Also calls avg_turns_to_major_impact from cpa.metrics.efficiency when available.
+    """
+    hits = [r["atmi"] for r in rows if r.get("atmi") is not None]
+    n_total = len(rows)
+    impact_hit_rate = round(len(hits) / n_total, 4) if n_total > 0 else 0.0
+    result: dict = {
+        "mean_turns": round(mean([float(h) for h in hits]), 4) if hits else None,
+        "impact_hit_rate": impact_hit_rate,
+        "n_hits": len(hits),
+        "n_total": n_total,
+    }
+    if _avg_atmi is not None:
+        try:
+            result["avg_atmi_lib"] = _avg_atmi([r.get("atmi") for r in rows])
+        except Exception:
+            pass
+    return result
+
+
 def _targets(cfg: dict, limit: int) -> list:
     ts = cfg["victim"]["targets"]
     return ts if limit <= 0 else ts[:limit]
 
 
-def _atmi_panel(rows: List[dict]) -> dict:
-    """None-safe ATMI: mean_turns only computed over hits (atmi is not None)."""
-    hits = [r["atmi"] for r in rows if r.get("atmi") is not None]
-    return {
-        "mean_turns": round(float(np.mean([float(h) for h in hits])), 4) if hits else None,
-        "impact_hit_rate": round(len(hits) / len(rows), 4) if rows else 0.0,
-        "n_hits": len(hits), "n_total": len(rows),
-    }
-
-
-def _bonferroni(t_result: dict, n_tests: int) -> dict:
-    """Add Bonferroni-corrected p to an existing _paired_t result dict."""
-    p = t_result.get("p")
-    if p is None:
-        return {**t_result, "p_bonferroni": None, "significant_0.05_bonferroni": False}
-    p_bonf = min(float(p) * n_tests, 1.0)
-    return {**t_result, "p_bonferroni": round(p_bonf, 6),
-            "significant_0.05_bonferroni": bool(p_bonf < 0.05)}
-
-
 def run_rq1(cfg: dict, episodes: int, turns: int, max_targets: int) -> dict:
-    """RQ1: context-aware (Group B) vs generic (Group A) CTI.
-
-    Also runs a 'control' arm (nopoison, same seeds/targets) to establish the LLM victim's
-    sampling noise floor. Any attack PDS within mean+2σ of the control is indistinguishable
-    from noise — reported as ASR_calibrated_% alongside the raw (threshold=0.30) ASR_%.
-    Multiple-comparison correction: Bonferroni across the 3 metrics tested (n_tests=3).
-    """
-    rows: dict = {"A": [], "B": [], "control": []}
+    rows = {"A": [], "B": []}
     for tgt in _targets(cfg, max_targets):
         for seed in range(episodes):
             for grp in ("A", "B"):
                 rows[grp].append(run_one(cfg, tgt, grp, "dream", turns, seed=seed))
-            # Control: nopoison arm to measure LLM sampling noise (same seed → paired)
-            rows["control"].append(run_one(cfg, tgt, "B", "nopoison", turns, seed=seed))
-
-    # Noise floor: PDS distribution when there is nothing to adopt
-    ctrl_pds = [r["max_pds"] for r in rows["control"]]
-    noise_mean = mean(ctrl_pds) if ctrl_pds else 0.0
-    noise_std = pstdev(ctrl_pds) if len(ctrl_pds) > 1 else 0.0
-    calibrated_thr = noise_mean + 2.0 * noise_std
-
-    out: dict = {}
-    out["noise_floor"] = {
-        "pds_mean": round(noise_mean, 4), "pds_std": round(noise_std, 4),
-        "calibrated_threshold": round(calibrated_thr, 4), "n": len(ctrl_pds),
-        "note": (
-            "LLM sampling noise: nopoison arm PDS distribution. "
-            "calibrated_threshold = mean+2σ = {:.3f}. "
-            "Attack episodes below this are indistinguishable from noise.".format(calibrated_thr)
-        ),
-    }
-
-    n_tests = 3  # final_pds, final_fpr, poison_adoption_rate
+    out = {}
+    # --- original metrics ---
     for metric in ("final_pds", "final_fpr", "poison_adoption_rate"):
-        raw_t = _paired_t([r[metric] for r in rows["B"]], [r[metric] for r in rows["A"]])
-        ctrl_t = _paired_t([r[metric] for r in rows["B"]], [r[metric] for r in rows["control"]])
         out[metric] = {
             "A": _summ([r[metric] for r in rows["A"]]),
             "B": _summ([r[metric] for r in rows["B"]]),
-            "control": _summ([r[metric] for r in rows["control"]]),
-            "paired_t_B_vs_A": _bonferroni(raw_t, n_tests),
-            "paired_t_B_vs_control": _bonferroni(ctrl_t, n_tests),
+            "paired_t_B_vs_A": _paired_t([r[metric] for r in rows["B"]],
+                                         [r[metric] for r in rows["A"]]),
         }
-
-    # PDS net of noise floor (non-circular: subtract what nopoison achieves)
-    b_pds = [r["final_pds"] for r in rows["B"]]
-    c_pds = [r["final_pds"] for r in rows["control"]]
-    pds_net = [b - c for b, c in zip(b_pds, c_pds[:len(b_pds)])]
-    out["pds_net_B"] = {**_summ(pds_net),
-                        "note": "PDS_B − PDS_control: net planning deviation above LLM noise"}
-
-    # §3.3 panel metrics
-    for metric in ("max_pds", "max_fpr", "cfr", "undetected_rate", "detection_score", "published"):
-        out[metric] = {g: _summ([r[metric] for r in rows[g]]) for g in ("A", "B", "control")}
-    out["atmi"] = {g: _atmi_panel(rows[g]) for g in ("A", "B", "control")}
-
-    out["ASR_%"] = {g: round(100 * mean([r["success"] for r in rows[g]]), 1)
-                    for g in ("A", "B")}
-    out["ASR_calibrated_%"] = {
-        g: round(100 * mean([1.0 if r["max_pds"] > calibrated_thr else 0.0
-                             for r in rows[g]]), 1)
-        for g in ("A", "B")
-    }
-    out["ASR_calibrated_%"]["note"] = (
-        "Success = PDS > nopoison mean+2σ={:.3f} (above LLM sampling noise)".format(calibrated_thr)
-    )
+    out["ASR_%"] = {g: round(100 * mean([r["success"] for r in rows[g]]), 1) for g in ("A", "B")}
     out["n_episodes_per_group"] = len(rows["A"])
+    # --- capstone §3.3 panel additions ---
+    for metric in ("max_pds", "max_fpr", "cfr", "undetected_rate", "detection_score", "published"):
+        out[metric] = {
+            "A": _summ([r[metric] for r in rows["A"]]),
+            "B": _summ([r[metric] for r in rows["B"]]),
+            "paired_t_B_vs_A": _paired_t([r[metric] for r in rows["B"]],
+                                         [r[metric] for r in rows["A"]]),
+        }
+    out["ATMI"] = {
+        "A": _atmi_panel(rows["A"]),
+        "B": _atmi_panel(rows["B"]),
+    }
     return out
 
 
@@ -203,19 +174,22 @@ def run_rq2(cfg: dict, episodes: int, turns: int, max_targets: int, cpa_model=No
         for seed in range(episodes):
             rows["dream"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed))
             rows["cpa"].append(run_one(cfg, tgt, "B", "cpa", turns, seed=seed, cpa_model=cpa_model))
-    n_tests = 8  # stealth_score, max_pds, max_fpr, mean_reward, published, cfr, undetected_rate, detection_score
     out = {}
+    # --- capstone §3.3 panel: extend tuple to include cfr, undetected_rate, detection_score ---
     for metric in ("stealth_score", "max_pds", "max_fpr", "mean_reward", "published",
                    "cfr", "undetected_rate", "detection_score"):
-        raw_t = _paired_t([r[metric] for r in rows["cpa"]], [r[metric] for r in rows["dream"]])
         out[metric] = {
             "dream": _summ([r[metric] for r in rows["dream"]]),
             "cpa": _summ([r[metric] for r in rows["cpa"]]),
-            "paired_t_cpa_vs_dream": _bonferroni(raw_t, n_tests),
+            "paired_t_cpa_vs_dream": _paired_t([r[metric] for r in rows["cpa"]],
+                                               [r[metric] for r in rows["dream"]]),
         }
-    out["atmi"] = {p: _atmi_panel(rows[p]) for p in ("dream", "cpa")}
     out["ASR_%"] = {p: round(100 * mean([r["success"] for r in rows[p]]), 1) for p in ("dream", "cpa")}
     out["n_episodes_per_policy"] = len(rows["dream"])
+    out["ATMI"] = {
+        "dream": _atmi_panel(rows["dream"]),
+        "cpa": _atmi_panel(rows["cpa"]),
+    }
     return out
 
 
@@ -295,16 +269,28 @@ def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int)
             rows["off"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed, defense=False))
             rows["on"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed, defense=True))
     out = {}
-    for metric in ("max_pds", "max_fpr", "stealth_score", "cfr", "undetected_rate", "detection_score"):
+    # --- original metrics ---
+    for metric in ("max_pds", "max_fpr", "stealth_score"):
         out[metric] = {
             "defense_off": _summ([r[metric] for r in rows["off"]]),
             "defense_on": _summ([r[metric] for r in rows["on"]]),
             "paired_t_off_vs_on": _paired_t([r[metric] for r in rows["off"]],
                                             [r[metric] for r in rows["on"]]),
         }
-    out["atmi"] = {arm: _atmi_panel(rows[arm]) for arm in ("off", "on")}
     out["ASR_%"] = {"defense_off": round(100 * mean([r["success"] for r in rows["off"]]), 1),
                     "defense_on": round(100 * mean([r["success"] for r in rows["on"]]), 1)}
+    # --- capstone §3.3 panel additions ---
+    for metric in ("cfr", "undetected_rate", "detection_score"):
+        out[metric] = {
+            "defense_off": _summ([r[metric] for r in rows["off"]]),
+            "defense_on": _summ([r[metric] for r in rows["on"]]),
+            "paired_t_off_vs_on": _paired_t([r[metric] for r in rows["off"]],
+                                            [r[metric] for r in rows["on"]]),
+        }
+    out["ATMI"] = {
+        "defense_off": _atmi_panel(rows["off"]),
+        "defense_on": _atmi_panel(rows["on"]),
+    }
     # Aggregate the feed-filter confusion matrix across all defense-ON episodes.
     agg = {"poison_blocked": 0, "poison_passed": 0, "real_blocked": 0, "real_passed": 0}
     for r in rows["on"]:
@@ -321,7 +307,6 @@ def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int)
         # Anti-starvation check: real records guaranteed into the feed now reach the verifier,
         # so this is > 0 (was always 0 before, which made real_retention_in_feed null).
         "real_in_feed_total": tn + fp,
-
         # Corpus-level: avg fraction of genuine CTI the verifier keeps (feed-starvation check).
         "real_corpus_retention": round(mean(rc), 4) if rc else None,
     }
