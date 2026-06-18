@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 from statistics import mean, pstdev
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -106,6 +106,16 @@ def _targets(cfg: dict, limit: int) -> list:
     return ts if limit <= 0 else ts[:limit]
 
 
+def _atmi_panel(rows: List[dict]) -> dict:
+    """None-safe ATMI: mean_turns only computed over hits (atmi is not None)."""
+    hits = [r["atmi"] for r in rows if r.get("atmi") is not None]
+    return {
+        "mean_turns": round(float(np.mean([float(h) for h in hits])), 4) if hits else None,
+        "impact_hit_rate": round(len(hits) / len(rows), 4) if rows else 0.0,
+        "n_hits": len(hits), "n_total": len(rows),
+    }
+
+
 def _bonferroni(t_result: dict, n_tests: int) -> dict:
     """Add Bonferroni-corrected p to an existing _paired_t result dict."""
     p = t_result.get("p")
@@ -168,6 +178,11 @@ def run_rq1(cfg: dict, episodes: int, turns: int, max_targets: int) -> dict:
     out["pds_net_B"] = {**_summ(pds_net),
                         "note": "PDS_B − PDS_control: net planning deviation above LLM noise"}
 
+    # §3.3 panel metrics
+    for metric in ("max_pds", "max_fpr", "cfr", "undetected_rate", "detection_score", "published"):
+        out[metric] = {g: _summ([r[metric] for r in rows[g]]) for g in ("A", "B", "control")}
+    out["atmi"] = {g: _atmi_panel(rows[g]) for g in ("A", "B", "control")}
+
     out["ASR_%"] = {g: round(100 * mean([r["success"] for r in rows[g]]), 1)
                     for g in ("A", "B")}
     out["ASR_calibrated_%"] = {
@@ -188,15 +203,17 @@ def run_rq2(cfg: dict, episodes: int, turns: int, max_targets: int, cpa_model=No
         for seed in range(episodes):
             rows["dream"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed))
             rows["cpa"].append(run_one(cfg, tgt, "B", "cpa", turns, seed=seed, cpa_model=cpa_model))
-    n_tests = 5  # stealth_score, max_pds, max_fpr, mean_reward, published
+    n_tests = 8  # stealth_score, max_pds, max_fpr, mean_reward, published, cfr, undetected_rate, detection_score
     out = {}
-    for metric in ("stealth_score", "max_pds", "max_fpr", "mean_reward", "published"):
+    for metric in ("stealth_score", "max_pds", "max_fpr", "mean_reward", "published",
+                   "cfr", "undetected_rate", "detection_score"):
         raw_t = _paired_t([r[metric] for r in rows["cpa"]], [r[metric] for r in rows["dream"]])
         out[metric] = {
             "dream": _summ([r[metric] for r in rows["dream"]]),
             "cpa": _summ([r[metric] for r in rows["cpa"]]),
             "paired_t_cpa_vs_dream": _bonferroni(raw_t, n_tests),
         }
+    out["atmi"] = {p: _atmi_panel(rows[p]) for p in ("dream", "cpa")}
     out["ASR_%"] = {p: round(100 * mean([r["success"] for r in rows[p]]), 1) for p in ("dream", "cpa")}
     out["n_episodes_per_policy"] = len(rows["dream"])
     return out
@@ -278,13 +295,14 @@ def run_defense_ablation(cfg: dict, episodes: int, turns: int, max_targets: int)
             rows["off"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed, defense=False))
             rows["on"].append(run_one(cfg, tgt, "B", "dream", turns, seed=seed, defense=True))
     out = {}
-    for metric in ("max_pds", "max_fpr", "stealth_score"):
+    for metric in ("max_pds", "max_fpr", "stealth_score", "cfr", "undetected_rate", "detection_score"):
         out[metric] = {
             "defense_off": _summ([r[metric] for r in rows["off"]]),
             "defense_on": _summ([r[metric] for r in rows["on"]]),
             "paired_t_off_vs_on": _paired_t([r[metric] for r in rows["off"]],
                                             [r[metric] for r in rows["on"]]),
         }
+    out["atmi"] = {arm: _atmi_panel(rows[arm]) for arm in ("off", "on")}
     out["ASR_%"] = {"defense_off": round(100 * mean([r["success"] for r in rows["off"]]), 1),
                     "defense_on": round(100 * mean([r["success"] for r in rows["on"]]), 1)}
     # Aggregate the feed-filter confusion matrix across all defense-ON episodes.
