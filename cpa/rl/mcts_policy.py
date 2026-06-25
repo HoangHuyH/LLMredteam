@@ -628,9 +628,17 @@ class MCTSPolicy:
         # live inference inside MCTS rollouts. Falls back to sequential if no profiles given.
         if target_profile and variant_profiles:
             ranked = _rank_by_profile(target_profile, variant_profiles, embed_fn)
-            self._cgps_order = [i % pool_size for i in ranked]
-            present = set(self._cgps_order)
-            self._cgps_order += [i for i in range(pool_size) if i not in present]
+            # Deduplicate while preserving relevance order (earlier = more relevant).
+            seen: set = set()
+            deduped: list = []
+            for i in ranked:
+                v = i % pool_size
+                if v not in seen:
+                    seen.add(v)
+                    deduped.append(v)
+            # Append any variants not covered by the ranked list.
+            deduped += [i for i in range(pool_size) if i not in seen]
+            self._cgps_order = deduped
         else:
             self._cgps_order = list(range(pool_size))  # [CPA-ORIGINAL] no context: sequential
         self._cgps_idx = 0
@@ -650,8 +658,11 @@ class MCTSPolicy:
         # [DREAM-CONCEPT: C-GPS] Cycle variants in relevance-ranked order.
         # DREAM's C-GPS retrieves the most contextually relevant attack each turn via
         # VectorRetriever.search; here we use the pre-computed ranking for efficiency.
-        idx = self._cgps_idx % len(self._cgps_order)
-        variant_id = self._cgps_order[idx]
+        if not self._cgps_order:
+            variant_id = 0
+        else:
+            idx = self._cgps_idx % len(self._cgps_order)
+            variant_id = self._cgps_order[idx]
         self._cgps_idx += 1
         # [CPA-ORIGINAL] MCTS plans over channel/frequency/timing with variant fixed.
         action = self._planner.plan(fix_variant=variant_id)
