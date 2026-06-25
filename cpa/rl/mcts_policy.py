@@ -1,12 +1,27 @@
-"""Monte-Carlo Tree Search (MCTS) attacker policy — DREAM planning baseline (RQ2).
+"""MCTS attacker policy — CPA's DREAM-inspired planning baseline (RQ2).
+
+Annotation key used throughout this file
+-----------------------------------------
+[DREAM-CONCEPT] — design adapts a concept from DREAM (Lu et al., 2026 arXiv:2512.19161).
+                  No code is imported from DREAM; the adaptation is described inline.
+[CPA-ORIGINAL]  — design is specific to this work and has no DREAM counterpart.
 
 Overview
 --------
-The DREAM baseline in the CPA proposal consists of C-GPS (context-guided poison selection)
-combined with an MCTS planner that looks ahead over a short horizon before committing to an
-action each turn.  The existing ``DreamBaselinePolicy`` is only the greedy, non-adaptive
-sub-case (always publish, maximum reach, no look-ahead).  This module provides the genuine
-MCTS variant so RQ2 has a real planning baseline to contrast against the RL policy (CPA).
+DREAM (Lu et al., 2026) uses two planning mechanisms not present in this repo:
+  1. C-GPS (Contextualized Guided Policy Search): VectorRetriever.search(query, k) —
+     semantic retrieval of atomic attack primitives from ChromaDB ranked by SentenceTransformer
+     similarity to the target context (see DREAM/Dream/mcp_retriever.py).
+  2. CE-AKG: cross-environment knowledge graph encoded implicitly via ChromaDB embeddings
+     and VectorRetriever; no standalone class exists in DREAM's codebase.
+  3. MCTS: DREAM does NOT implement UCT/MCTS. eval.py uses linear LLM orchestration.
+
+What this module provides
+--------------------------
+[CPA-ORIGINAL] A UCT planner over a surrogate CPA reward model.
+[DREAM-CONCEPT: C-GPS] MCTSPolicy uses relevance-ranked variant rotation instead of plain
+cyclic: at init time, variant texts are ranked by cosine similarity to the target profile
+(adapting VectorRetriever.search), and the MCTS planner cycles through variants in that order.
 
 Surrogate reward model
 ----------------------
@@ -83,15 +98,17 @@ Usage
 Instantiate via ``make_policy("mcts", pool_size, seed, model=None)`` or
 ``make_policy("mcts_only", pool_size, seed, model=None)``.
 
-``"mcts"`` — full C-GPS+MCTS: cycles through all variants in ``[0, pool_size)`` while
-running the MCTS planner for channel/frequency/timing.
+``"mcts"`` — C-GPS+MCTS: variants rotated in relevance-ranked order (see _rank_by_profile)
+while the MCTS planner chooses optimal channel/frequency/timing. Pass ``target_profile`` +
+``variant_profiles`` at construction for full C-GPS; falls back to sequential order otherwise.
 
-``"mcts_only"`` — MCTS controls variant selection too (searches over variant_ids up to
-``max_variants``), ignoring C-GPS rotation.
+``"mcts_only"`` — [CPA-ORIGINAL] MCTS controls ALL action dimensions including variant_id;
+no C-GPS ranking applied.
 """
 from __future__ import annotations
 
 import math
+import re
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
@@ -169,6 +186,60 @@ def _surrogate_reward(
         reward_weights,
     )
     return reward, new_heat
+
+
+# ---------------------------------------------------------------------------
+# [DREAM-CONCEPT: C-GPS] Contextualized Guided Policy Search — adapted for CTI poisoning
+#
+# DREAM's C-GPS = VectorRetriever.search(query_text, k) in mcp_retriever.py:
+#   query_vector = SentenceTransformer.encode(query_text)
+#   results = chromadb_collection.query(query_embeddings=[query_vector], n_results=k)
+#   return [mcp_id ranked by 1 - cosine_distance]
+#
+# Adaptation here: rank fake CTI variants by cosine similarity to the target profile at
+# init time, then rotate through in relevance-descending order each turn.
+# Live-per-turn vector search is replaced by one-time ranking because the surrogate
+# planner cannot call the real environment during MCTS rollouts.
+# ---------------------------------------------------------------------------
+
+def _cosine_keyword_sim(a: str, b: str) -> float:
+    """Token-overlap cosine similarity — lightweight proxy for SentenceTransformer.
+
+    [DREAM-CONCEPT: C-GPS] DREAM uses dense SentenceTransformer embeddings; this is a
+    dependency-free fallback. Wire embed_fn into _rank_by_profile for full accuracy.
+    """
+    tokens_a = set(re.sub(r"[^a-z0-9 ]", " ", a.lower()).split())
+    tokens_b = set(re.sub(r"[^a-z0-9 ]", " ", b.lower()).split())
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / math.sqrt(len(tokens_a) * len(tokens_b))
+
+
+def _rank_by_profile(
+    target_profile: str,
+    variant_profiles: List[str],
+    embed_fn=None,
+) -> List[int]:
+    """Return variant indices ranked descending by relevance to target_profile.
+
+    [DREAM-CONCEPT: C-GPS] Mirrors VectorRetriever.search: returns indices ranked by
+    1 - cosine_distance. If embed_fn (callable: List[str] -> np.ndarray[N, D]) is provided,
+    uses dense vectors (matches DREAM's SentenceTransformer path); otherwise keyword overlap.
+    """
+    if not variant_profiles:
+        return []
+    if embed_fn is not None:
+        try:
+            vecs = np.array(embed_fn([target_profile] + variant_profiles), dtype=np.float32)
+            q = vecs[0]
+            vs = vecs[1:]
+            norms = np.linalg.norm(vs, axis=1, keepdims=True).clip(min=1e-9)
+            sims = (vs / norms) @ (q / max(float(np.linalg.norm(q)), 1e-9))
+            return list(np.argsort(-sims))
+        except Exception:
+            pass
+    sims = [_cosine_keyword_sim(target_profile, vp) for vp in variant_profiles]
+    return list(np.argsort([-s for s in sims]))
 
 
 # ---------------------------------------------------------------------------
@@ -498,13 +569,15 @@ class _MCTSPlanner:
 # ---------------------------------------------------------------------------
 
 class MCTSPolicy:
-    """C-GPS + MCTS planner — the full DREAM planning baseline.
+    """C-GPS + MCTS planner — CPA's DREAM-inspired planning baseline for RQ2.
 
-    Variant selection follows C-GPS rotation (cycles through all variants so every
-    fake CTI record gets exposure), while the MCTS planner chooses the optimal
-    (channel, frequency, timing) tuple for the selected variant.
+    [DREAM-CONCEPT: C-GPS] Variant selection uses relevance-ranked rotation: at init time,
+    variant texts are ranked by cosine similarity to the target profile, adapting DREAM's
+    VectorRetriever.search(query_text, k). Pass ``target_profile`` + ``variant_profiles``
+    for full C-GPS behaviour; without them, falls back to sequential order.
 
-    This is the recommended ``"mcts"`` policy for RQ2.
+    [CPA-ORIGINAL] The MCTS planner (UCT on a surrogate reward) has no counterpart in
+    DREAM — DREAM's eval.py uses linear LLM orchestration, not tree search.
 
     Parameters
     ----------
@@ -524,6 +597,15 @@ class MCTSPolicy:
         Episode length used for publish-cost normalisation (default 25).
     reward_weights:
         Optional dict overriding the default reward weights.
+    target_profile:
+        [DREAM-CONCEPT: C-GPS] Target context string (e.g. technology stack). Used to rank
+        variants by relevance, mirroring DREAM's VectorRetriever query.
+    variant_profiles:
+        [DREAM-CONCEPT: C-GPS] Text for each variant in the pool. Ranked against
+        target_profile to determine C-GPS rotation order.
+    embed_fn:
+        Optional callable (List[str] -> np.ndarray) for dense embeddings matching DREAM's
+        SentenceTransformer path. Falls back to keyword overlap if None.
     """
 
     def __init__(
@@ -536,9 +618,22 @@ class MCTSPolicy:
         gamma: float = 0.95,
         max_turns: int = 25,
         reward_weights: Optional[Dict[str, float]] = None,
+        target_profile: str = "",
+        variant_profiles: Optional[List[str]] = None,
+        embed_fn=None,
     ) -> None:
         self.pool_size = pool_size
-        self._cgps_idx = 0   # C-GPS rotation counter
+        # [DREAM-CONCEPT: C-GPS] Pre-rank variants by relevance to target profile.
+        # DREAM calls VectorRetriever.search per turn; we pre-rank once at init to avoid
+        # live inference inside MCTS rollouts. Falls back to sequential if no profiles given.
+        if target_profile and variant_profiles:
+            ranked = _rank_by_profile(target_profile, variant_profiles, embed_fn)
+            self._cgps_order = [i % pool_size for i in ranked]
+            present = set(self._cgps_order)
+            self._cgps_order += [i for i in range(pool_size) if i not in present]
+        else:
+            self._cgps_order = list(range(pool_size))  # [CPA-ORIGINAL] no context: sequential
+        self._cgps_idx = 0
         self._planner = _MCTSPlanner(
             pool_size=pool_size,
             seed=seed,
@@ -552,10 +647,13 @@ class MCTSPolicy:
         )
 
     def __call__(self, state: np.ndarray) -> CPAAction:
-        # C-GPS: pick variant by rotation so each record gets exposure.
-        variant_id = self._cgps_idx % self.pool_size
+        # [DREAM-CONCEPT: C-GPS] Cycle variants in relevance-ranked order.
+        # DREAM's C-GPS retrieves the most contextually relevant attack each turn via
+        # VectorRetriever.search; here we use the pre-computed ranking for efficiency.
+        idx = self._cgps_idx % len(self._cgps_order)
+        variant_id = self._cgps_order[idx]
         self._cgps_idx += 1
-        # MCTS plans over channel/frequency/timing with this variant fixed.
+        # [CPA-ORIGINAL] MCTS plans over channel/frequency/timing with variant fixed.
         action = self._planner.plan(fix_variant=variant_id)
         self._planner.step(action)
         return action
@@ -564,9 +662,10 @@ class MCTSPolicy:
 class MCTSOnlyPolicy:
     """MCTS-only planner — MCTS controls ALL action dimensions including variant_id.
 
-    Unlike ``MCTSPolicy``, this policy does not use C-GPS rotation: the tree searches
-    over ``variant_ids ∈ [0, min(pool_size, max_variants))`` jointly with channel,
-    frequency, and timing.  Use as the ``"mcts_only"`` policy name.
+    [CPA-ORIGINAL] Unlike MCTSPolicy, no C-GPS ranking is applied: the tree searches over
+    ``variant_ids ∈ [0, min(pool_size, max_variants))`` jointly with channel, frequency,
+    and timing. The ``target_profile``, ``variant_profiles``, and ``embed_fn`` parameters
+    are accepted for API compatibility with MCTSPolicy but are unused.
 
     Parameters
     ----------
@@ -578,6 +677,9 @@ class MCTSOnlyPolicy:
         Same as ``MCTSPolicy``.
     max_variants:
         Cap on the number of variant_ids searched (default 4, keeps tree width ≤ 32).
+    target_profile, variant_profiles, embed_fn:
+        Accepted for API compatibility with MCTSPolicy; unused (MCTSOnly searches variants
+        directly via tree rather than C-GPS ranking).
     """
 
     def __init__(
@@ -591,6 +693,9 @@ class MCTSOnlyPolicy:
         max_turns: int = 25,
         max_variants: int = 4,
         reward_weights: Optional[Dict[str, float]] = None,
+        target_profile: str = "",
+        variant_profiles: Optional[List[str]] = None,
+        embed_fn=None,
     ) -> None:
         self.pool_size = pool_size
         self._planner = _MCTSPlanner(

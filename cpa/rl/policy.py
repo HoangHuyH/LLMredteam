@@ -1,13 +1,20 @@
 """Policies mapping state -> CPAAction.
 
-- RandomPolicy        : random everything (Group-A stealth baseline).
-- DreamBaselinePolicy : the DREAM C-GPS / AutoADAPTer baseline — greedy, non-adaptive:
-                        publishes every turn on a high-reach but noisy channel. No learning.
-- CPAPolicy           : our hybrid-RL policy (PPO+LoRA). Uses a trained SB3 model when
-                        provided; otherwise a stealth-aware heuristic (burst-then-throttle on a
-                        low-detection channel) so the pipeline runs before training.
+Annotation key
+--------------
+[DREAM-CONCEPT] — design adapts a concept from DREAM (Lu et al., 2026); no DREAM code imported.
+[CPA-ORIGINAL]  — specific to this work.
 
-RQ2 compares DreamBaselinePolicy vs CPAPolicy on ASR + stealth.
+- RandomPolicy        : [CPA-ORIGINAL] uniform random baseline.
+- DreamBaselinePolicy : [DREAM-CONCEPT] greedy heuristic inspired by DREAM's non-adaptive
+                        C-GPS behaviour (always publish, max reach, no look-ahead, no learning).
+                        NOT used in the 5 RQ2 ablation arms — superseded by MCTSPolicy.
+- CPAPolicy           : [CPA-ORIGINAL] hybrid-RL policy (PPO). Trained SB3 model when provided;
+                        otherwise burst-then-throttle heuristic.
+
+RQ2 arms: cpa (CPAPolicy+PPO) vs mcts (MCTSPolicy in mcts_policy.py, DREAM-inspired C-GPS+UCT)
+vs random vs nopoison. MCTSPolicy uses relevance-ranked C-GPS variant selection (adapting
+DREAM's VectorRetriever.search) combined with a CPA-original UCT surrogate planner.
 """
 from __future__ import annotations
 
@@ -31,7 +38,16 @@ class RandomPolicy:
 
 
 class DreamBaselinePolicy:
-    """Greedy C-GPS baseline: always publish, maximize reach, ignore stealth/cost."""
+    """Greedy heuristic baseline inspired by DREAM's non-adaptive C-GPS behaviour.
+
+    [DREAM-CONCEPT] Models what DREAM does without MCTS or relevance ranking: always publishes
+    every turn on the highest-reach channel, cycling through variants sequentially. This is the
+    degenerate case of C-GPS with no context guidance or look-ahead.
+    [CPA-ORIGINAL] Channel choice (PASTEBIN) and always-publish rule are CPA-specific.
+
+    NOT used in the 5 RQ2 ablation arms (superseded by MCTSPolicy as the DREAM baseline).
+    Kept for reference and quick smoke tests.
+    """
 
     def __init__(self, pool_size: int, **_) -> None:
         self.pool_size = pool_size
@@ -121,7 +137,7 @@ def decode_action(action, pool_size: int) -> CPAAction:
     )
 
 
-def make_policy(name: str, pool_size: int, seed: int = 0, model=None):
+def make_policy(name: str, pool_size: int, seed: int = 0, model=None, **kwargs):
     if name == "random":
         return RandomPolicy(pool_size, rng_seed=seed)
     if name == "dream":
@@ -135,8 +151,16 @@ def make_policy(name: str, pool_size: int, seed: int = 0, model=None):
     if name == "heuristic":
         return CPAPolicy(pool_size, model=None)  # burst-then-throttle heuristic, no PPO model
     if name in ("mcts", "mcts_only"):
-        # DREAM planning baseline (C-GPS+MCTS). Imported lazily so the lightweight policies above
-        # never pull the MCTS module unless asked for.
+        # [DREAM-CONCEPT: C-GPS] Pass target_profile + variant_profiles so MCTSPolicy can rank
+        # variants by semantic relevance, adapting DREAM's VectorRetriever.search(query, k).
+        # Imported lazily so lightweight policies above never pull the MCTS module.
         from cpa.rl.mcts_policy import MCTSPolicy, MCTSOnlyPolicy
-        return (MCTSPolicy if name == "mcts" else MCTSOnlyPolicy)(pool_size, seed=seed)
+        cls = MCTSPolicy if name == "mcts" else MCTSOnlyPolicy
+        return cls(
+            pool_size,
+            seed=seed,
+            target_profile=kwargs.get("target_profile", ""),
+            variant_profiles=kwargs.get("variant_profiles"),
+            embed_fn=kwargs.get("embed_fn"),
+        )
     raise ValueError(f"Unknown policy: {name!r}")

@@ -100,7 +100,17 @@ def run_one(cfg: dict, target: dict, group: str, policy_name: str,
                        ground_truth_ids, embed_fn, detector_fn, env_cfg,
                        ceakg=ceakg, verifier=verifier)
 
-    policy = make_policy(policy_name, pool_size=len(pool), seed=seed, model=cpa_model)
+    # [DREAM-CONCEPT: C-GPS] For MCTS policies, pass target profile + variant texts so
+    # MCTSPolicy can rank variants by semantic relevance, adapting DREAM's VectorRetriever.search.
+    if policy_name in ("mcts", "mcts_only"):
+        variant_texts = [r.text() for r in pool]
+        policy = make_policy(
+            policy_name, pool_size=len(pool), seed=seed, model=cpa_model,
+            target_profile=target.get("profile", ""),
+            variant_profiles=variant_texts,
+        )
+    else:
+        policy = make_policy(policy_name, pool_size=len(pool), seed=seed, model=cpa_model)
 
     # Universe of attacker-injected fake CVEs; "adoption" = the victim echoing any of these in its
     # output (the TARGETED impact signal, vs PDS's undirected drift).

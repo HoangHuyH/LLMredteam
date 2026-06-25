@@ -1,6 +1,9 @@
-"""Phase 1 offline pre-training (capstone §2.8): behavior-clone the DREAM (C-GPS+MCTS)
-baseline into the PPO MlpPolicy, then let the online curriculum (train_ppo_curriculum,
-reset_num_timesteps=False) continue from the imitation-warm-started weights.
+"""Phase 1 offline pre-training (capstone §2.8): behavior-clone MCTSPolicy — CPA's
+DREAM-inspired planning baseline — into the PPO MlpPolicy, then let the online curriculum
+(train_ppo_curriculum, reset_num_timesteps=False) continue from the imitation-warm-started weights.
+
+Note: "cloning DREAM" here means cloning MCTSPolicy trajectories (cpa/rl/mcts_policy.py),
+which adapts DREAM's C-GPS+MCTS concepts. No code is imported from DREAM's repository.
 
 Pipeline:
   1. collect_dream  — roll out the MCTS/DREAM policy on the rule_based PoisoningGymEnv,
@@ -46,7 +49,7 @@ def collect_dream(cfg: dict, n_episodes: int = 800, turns: int = 15, seed: int =
     act_buf: List[np.ndarray] = []
     for ep in range(n_episodes):
         obs, _ = env.reset()
-        # Fresh DREAM policy per episode so its internal C-GPS/heat state resets; vary the seed.
+        # Fresh MCTSPolicy (DREAM-inspired) per episode so C-GPS ranking and heat state reset; vary seed.
         dream = make_policy(policy_name, pool_size, seed=seed + ep)
         for _ in range(turns):
             cpa_action = dream(obs)
@@ -113,7 +116,7 @@ def bc_pretrain(config_path: str, out: str, n_episodes: int = 800, turns: int = 
         cfg = yaml.safe_load(f)
     seed = cfg["experiment"].get("seed", 0)
 
-    print(f"[bc] collecting {n_episodes} DREAM trajectories (turns={turns}) on rule_based victim...",
+    print(f"[bc] collecting {n_episodes} MCTSPolicy (DREAM-inspired) trajectories (turns={turns}) on rule_based victim...",
           flush=True)
     obs, actions = collect_dream(cfg, n_episodes=n_episodes, turns=turns, seed=seed,
                                  policy_name=policy_name)
